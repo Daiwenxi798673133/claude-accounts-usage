@@ -46,12 +46,14 @@ function safeJson(body?: string): { error?: { type?: unknown; message?: unknown 
   }
 }
 
-// Distinguishes a Claude Pro/Max subscription quota exhaustion (5h / weekly) from
-// transient per-minute 429s and 529 overloads — switching accounts only helps the
-// former. Trusts Anthropic's unified rate-limit headers first, falls back to body
-// type+text. Anthropic's wording may drift, so this regex is the one maintenance point.
+// Detects a Claude Pro/Max rate-limit / quota rejection so we can switch accounts.
+// 529 overloads are excluded (switching won't help). Anthropic surfaces this through
+// several shapes depending on path (unified headers, JSON body type, or just a message
+// string like "This request would exceed your account's rate limit"), so we match on
+// ANY of: 429 status, rate_limit_error type, or rate-limit message text — the message
+// regex is the one maintenance point as Anthropic's wording may drift.
 function isUsageLimit(error?: RetryErrorLike): boolean {
-  if (!error || error.statusCode !== 429) return false
+  if (!error) return false
   const body = error.responseBody ?? ""
   if (/overloaded_error/i.test(body)) return false
   const headers = lowerKeys(error.responseHeaders)
@@ -62,9 +64,9 @@ function isUsageLimit(error?: RetryErrorLike): boolean {
   if (unifiedRejected) return true
   const parsed = safeJson(body)?.error
   const type = typeof parsed?.type === "string" ? parsed.type : ""
-  const message = `${typeof parsed?.message === "string" ? parsed.message : ""} ${error.message ?? ""}`
-  const quota = /usage limit|limit reached|out of (?:usage|quota)|5[- ]?hour|weekly limit|exceed/i.test(message)
-  return type === "rate_limit_error" && quota
+  const text = `${typeof parsed?.message === "string" ? parsed.message : ""} ${error.message ?? ""}`.toLowerCase()
+  const rateLimitText = /rate limit|usage limit|limit reached|too many requests|out of (?:usage|quota)|5[- ]?hour|weekly limit|exceed/.test(text)
+  return error.statusCode === 429 || type === "rate_limit_error" || rateLimitText
 }
 
 function parseResetMs(error: RetryErrorLike): number | undefined {
