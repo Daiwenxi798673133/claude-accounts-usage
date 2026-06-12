@@ -108,7 +108,6 @@ function sleep(ms: number): Promise<void> {
 }
 
 function debugLog(tag: string, payload: unknown): void {
-  if (!process.env.CLAUDE_AUTOSWITCH_DEBUG) return
   let serialized: string
   try {
     serialized = JSON.stringify(payload)
@@ -245,6 +244,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     const message = soonest
       ? `所有账号都已达额度上限，约 ${fmtDuration(soonest - now)} 后恢复`
       : "所有账号都已达额度上限"
+    debugLog("standdown", { accounts: file.accounts.length, soonest })
     api.ui.toast({ variant: "error", message })
   }
 
@@ -266,6 +266,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
         const account = await switchToAccount(next.id)
         tried.add(next.id)
         lastSwitch = { id: account.id, sessionID, at: Date.now() }
+        debugLog("switched", { from: labelOf(file, activeId), to: account.label })
         api.ui.toast({
           variant: "warning",
           message: `「${labelOf(file, activeId)}」额度已满，已切到「${account.label}」并自动重试`,
@@ -387,26 +388,36 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   }
 
   async function onRetried(event: { id: string; properties: { sessionID: string; error: RetryErrorLike } }): Promise<void> {
-    if (!ENABLED || !dedup(event.id)) return
     const error = event.properties.error
-    if (!isUsageLimit(error)) {
-      debugLog("retried-unmatched", error)
-      return
-    }
-    if (!isAnthropicSession(event.properties.sessionID)) return
+    debugLog("retried", {
+      sessionID: event.properties.sessionID,
+      statusCode: error?.statusCode,
+      message: error?.message,
+      headerKeys: Object.keys(error?.responseHeaders ?? {}),
+      body: (error?.responseBody ?? "").slice(0, 300),
+    })
+    if (!ENABLED || !dedup(event.id)) return
+    const matched = isUsageLimit(error)
+    const anthropic = isAnthropicSession(event.properties.sessionID)
+    debugLog("retried-decision", { matched, anthropic })
+    if (!matched || !anthropic) return
     await handleLimit(event.properties.sessionID, error, "retry")
   }
 
   async function onError(event: { id: string; properties: { sessionID?: string; error?: unknown } }): Promise<void> {
-    if (!ENABLED || !dedup(event.id)) return
     const sessionID = event.properties.sessionID
-    if (!sessionID) return
     const error = toErrorData(event.properties.error)
-    if (!error || !isUsageLimit(error)) {
-      debugLog("error-unmatched", event.properties.error)
-      return
-    }
-    if (!isAnthropicSession(sessionID)) return
+    debugLog("error", {
+      sessionID,
+      raw: event.properties.error,
+      statusCode: error?.statusCode,
+      message: error?.message,
+    })
+    if (!ENABLED || !dedup(event.id) || !sessionID) return
+    const matched = !!error && isUsageLimit(error)
+    const anthropic = isAnthropicSession(sessionID)
+    debugLog("error-decision", { matched, anthropic })
+    if (!matched || !anthropic) return
     await handleLimit(sessionID, error, "error")
   }
 
@@ -417,6 +428,8 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       if (activeId) clearCooldown(activeId)
     }
   }
+
+  debugLog("installed", { enabled: ENABLED })
 
   const offs = [
     api.event.on("session.next.retried", (event) => {
