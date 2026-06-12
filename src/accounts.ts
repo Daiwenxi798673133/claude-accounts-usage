@@ -3,6 +3,7 @@ import { homedir } from "node:os"
 import { join, dirname } from "node:path"
 
 export type StoredAccount = {
+  id: string
   label: string
   refresh: string
   access?: string
@@ -11,7 +12,7 @@ export type StoredAccount = {
 
 export type AccountsFile = {
   version: number
-  activeIndex: number
+  activeId?: string
   accounts: StoredAccount[]
 }
 
@@ -19,6 +20,12 @@ export type AnthropicOauth = {
   type: "oauth"
   access?: string
   refresh?: string
+  expires?: number
+}
+
+export type AuthToken = {
+  refresh: string
+  access?: string
   expires?: number
 }
 
@@ -59,8 +66,10 @@ export async function loadAccounts(): Promise<AccountsFile> {
   const data = await readJson<Partial<AccountsFile>>(ACCOUNTS_PATH)
   return {
     version: data?.version ?? 1,
-    activeIndex: typeof data?.activeIndex === "number" ? data.activeIndex : -1,
-    accounts: Array.isArray(data?.accounts) ? (data!.accounts as StoredAccount[]) : [],
+    activeId: data?.activeId,
+    accounts: Array.isArray(data?.accounts)
+      ? (data!.accounts as StoredAccount[]).filter((account) => typeof account.id === "string" && account.id.length > 0)
+      : [],
   }
 }
 
@@ -77,65 +86,39 @@ export async function readAuthAnthropic(): Promise<AnthropicOauth | undefined> {
   return undefined
 }
 
-export async function writeAuthAnthropic(account: StoredAccount): Promise<void> {
+export async function writeAuthAnthropic(token: AuthToken): Promise<void> {
   const path = await resolveAuthJsonPath()
   const auth = (await readJson<Record<string, unknown>>(path)) ?? {}
   auth["anthropic"] = {
     type: "oauth",
-    access: account.access ?? "",
-    refresh: account.refresh,
-    expires: account.expires ?? 0,
+    access: token.access ?? "",
+    refresh: token.refresh,
+    expires: token.expires ?? 0,
   }
   await atomicWriteJson(path, auth)
 }
 
-export async function addAccountFromCurrentAuth(label?: string): Promise<StoredAccount | undefined> {
-  const current = await readAuthAnthropic()
-  if (!current?.refresh) return undefined
-
+export async function upsertAccount(id: string, label: string, token: AuthToken): Promise<AccountsFile> {
   const file = await loadAccounts()
-  const account: StoredAccount = {
-    label: label ?? `Account ${file.accounts.length + 1}`,
-    refresh: current.refresh,
-    access: current.access,
-    expires: current.expires,
-  }
-
-  const existing = file.accounts.findIndex((a) => a.refresh === current.refresh)
-  if (existing >= 0) {
-    account.label = file.accounts[existing].label
-    file.accounts[existing] = account
-    file.activeIndex = existing
+  const index = file.accounts.findIndex((account) => account.id === id)
+  if (index >= 0) {
+    file.accounts[index] = {
+      ...file.accounts[index],
+      refresh: token.refresh,
+      access: token.access,
+      expires: token.expires,
+    }
   } else {
-    file.accounts.push(account)
-    file.activeIndex = file.accounts.length - 1
+    file.accounts.push({ id, label, refresh: token.refresh, access: token.access, expires: token.expires })
   }
-
+  file.activeId = id
   await saveAccounts(file)
-  return account
-}
-
-// auth.json only ever holds the account we last switched to (ex-machina refreshes
-// that same identity in place), so its current token belongs to accounts[activeIndex].
-// Copying it back reclaims any rotated refresh token ex-machina wrote after a refresh.
-export async function syncActiveFromAuth(file: AccountsFile): Promise<AccountsFile> {
-  if (file.activeIndex < 0 || file.activeIndex >= file.accounts.length) return file
-  const current = await readAuthAnthropic()
-  if (!current?.refresh) return file
-
-  const active = file.accounts[file.activeIndex]
-  if (current.refresh !== active.refresh || current.access !== active.access || current.expires !== active.expires) {
-    active.refresh = current.refresh
-    active.access = current.access
-    active.expires = current.expires
-    await saveAccounts(file)
-  }
   return file
 }
 
-export async function setActiveIndex(index: number): Promise<void> {
+export async function setActiveId(id: string): Promise<void> {
   const file = await loadAccounts()
-  if (index < 0 || index >= file.accounts.length) return
-  file.activeIndex = index
+  if (!file.accounts.some((account) => account.id === id)) return
+  file.activeId = id
   await saveAccounts(file)
 }

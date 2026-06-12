@@ -120,16 +120,16 @@ export function openUsageDialog(api: TuiPluginApi, state: () => UsageState): voi
 export function openSwitchDialog(
   api: TuiPluginApi,
   accounts: StoredAccount[],
-  activeIndex: number,
-  onSwitch: (index: number) => void | Promise<void>,
+  activeId: string | undefined,
+  onSwitch: (id: string) => void | Promise<void>,
 ): void {
   api.ui.dialog.replace(() =>
-    api.ui.DialogSelect<number>({
+    api.ui.DialogSelect<string>({
       title: "切换 Claude 账号",
-      current: activeIndex,
-      options: accounts.map((account, index) => ({
-        title: index === activeIndex ? `${account.label} (当前)` : account.label,
-        value: index,
+      current: activeId,
+      options: accounts.map((account) => ({
+        title: account.id === activeId ? `${account.label} (当前)` : account.label,
+        value: account.id,
       })),
       onSelect: (option) => {
         api.ui.dialog.clear()

@@ -7,6 +7,8 @@ export const TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 
 export const USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 
+export const PROFILE_ENDPOINT = "https://api.anthropic.com/api/oauth/profile"
+
 export const OAUTH_BETA = "oauth-2025-04-20"
 
 // Refresh slightly before real expiry so neither ex-machina nor the usage call
