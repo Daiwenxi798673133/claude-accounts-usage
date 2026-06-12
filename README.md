@@ -20,17 +20,36 @@
 
 ## 安装
 
-在 `~/.config/opencode/tui.json` 注册(TUI 插件只在 `tui.json` 配置,不要放 `opencode.json`):
+TUI 插件只在 `~/.config/opencode/tui.json` 配置,**不要**放进 `opencode.json`。
+
+### 方式一:npm(推荐)
 
 ```json
 {
-  "plugin": [
-    ["/Users/你的用户名/Desktop/claude-accounts-usage/tui.tsx", {}]
-  ]
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": ["claude-accounts-usage"]
 }
 ```
 
-修改配置后完全退出并重新打开 OpenCode。
+OpenCode 会自动解析并安装该包,无需手动 `npm install`。
+
+### 方式二:本地 clone(开发/离线)
+
+```bash
+git clone https://github.com/Daiwenxi798673133/claude-accounts-usage.git
+cd claude-accounts-usage && bun install
+```
+
+然后让 `tui.json` 指向克隆下来的 `tui.tsx` 绝对路径:
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": ["/绝对路径/claude-accounts-usage/tui.tsx"]
+}
+```
+
+修改配置后**完全退出并重新打开** OpenCode。
 
 ## 账号管理流程
 
