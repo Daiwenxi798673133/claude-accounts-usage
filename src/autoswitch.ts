@@ -404,6 +404,25 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     await handleLimit(event.properties.sessionID, error, "retry")
   }
 
+  async function onStatus(event: {
+    id: string
+    properties: { sessionID: string; status?: { type: string; message?: string; next?: number } }
+  }): Promise<void> {
+    const status = event.properties.status
+    debugLog("status", {
+      sessionID: event.properties.sessionID,
+      type: status?.type,
+      message: status?.type === "retry" ? status.message : undefined,
+    })
+    if (status?.type !== "retry" || !ENABLED || !dedup(event.id)) return
+    const error: RetryErrorLike = { message: status.message }
+    const matched = isUsageLimit(error)
+    const anthropic = isAnthropicSession(event.properties.sessionID)
+    debugLog("status-decision", { matched, anthropic })
+    if (!matched || !anthropic) return
+    await handleLimit(event.properties.sessionID, error, "retry")
+  }
+
   async function onError(event: { id: string; properties: { sessionID?: string; error?: unknown } }): Promise<void> {
     const sessionID = event.properties.sessionID
     const error = toErrorData(event.properties.error)
@@ -432,6 +451,9 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   debugLog("installed", { enabled: ENABLED })
 
   const offs = [
+    api.event.on("session.status", (event) => {
+      void onStatus(event)
+    }),
     api.event.on("session.next.retried", (event) => {
       void onRetried(event)
     }),
