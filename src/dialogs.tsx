@@ -87,33 +87,31 @@ function AccountBlock(props: { api: TuiPluginApi; item: AccountUsage }) {
 
 function UsageDialog(props: { api: TuiPluginApi; state: () => UsageState }) {
   const api = props.api
-  const Dialog = api.ui.Dialog
   const theme = () => api.theme.current
   return (
-    <Dialog size="large" onClose={() => api.ui.dialog.clear()}>
-      <box flexDirection="column" gap={1} padding={1}>
-        <box flexDirection="row" justifyContent="space-between">
-          <text fg={theme().text}>
-            <b>Claude 账号用量</b>
-          </text>
-          <text fg={theme().textMuted}>esc 关闭</text>
-        </box>
-        <Show when={props.state().loading && props.state().results.length === 0}>
-          <text fg={theme().textMuted}>加载中…</text>
-        </Show>
-        <Show when={props.state().error}>
-          <text fg={theme().error}>{props.state().error}</text>
-        </Show>
-        <For each={props.state().results}>{(item) => <AccountBlock api={api} item={item} />}</For>
-        <Show when={props.state().updatedAt}>
-          <text fg={theme().textMuted}>更新于 {clockTime(props.state().updatedAt!)}</text>
-        </Show>
+    <box paddingTop={1} paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1} flexDirection="column">
+      <box flexDirection="row" justifyContent="space-between">
+        <text fg={theme().text}>
+          <b>Claude 账号用量</b>
+        </text>
+        <text fg={theme().textMuted}>esc 关闭</text>
       </box>
-    </Dialog>
+      <Show when={props.state().loading && props.state().results.length === 0}>
+        <text fg={theme().textMuted}>加载中…</text>
+      </Show>
+      <Show when={props.state().error}>
+        <text fg={theme().error}>{props.state().error}</text>
+      </Show>
+      <For each={props.state().results}>{(item) => <AccountBlock api={api} item={item} />}</For>
+      <Show when={props.state().updatedAt}>
+        <text fg={theme().textMuted}>更新于 {clockTime(props.state().updatedAt!)}</text>
+      </Show>
+    </box>
   )
 }
 
 export function openUsageDialog(api: TuiPluginApi, state: () => UsageState): void {
+  api.ui.dialog.setSize("medium")
   api.ui.dialog.replace(() => <UsageDialog api={api} state={state} />)
 }
 
