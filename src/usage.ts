@@ -1,5 +1,5 @@
 import type { AuthToken, StoredAccount } from "./accounts.ts"
-import { loadAccounts, readAuthAnthropic, saveAccounts, upsertAccount, writeAuthAnthropic } from "./accounts.ts"
+import { loadAccounts, readAuthAnthropic, saveAccounts, upsertAccount, withAuthLock, writeAuthAnthropic } from "./accounts.ts"
 import { CLIENT_ID, OAUTH_BETA, TOKEN_EXPIRY_BUFFER_MS, TOKEN_URL, USAGE_ENDPOINT } from "./constants.ts"
 import { fetchProfile } from "./profile.ts"
 
@@ -55,17 +55,19 @@ export async function fetchUsage(access: string): Promise<UsageResponse> {
 // uuid (stable across token rotation) and upsert it: the same account is updated in
 // place, a genuinely new login is added — so no manual /account-add is needed.
 export async function autoCapture(): Promise<void> {
-  const auth = await readAuthAnthropic()
-  if (!auth?.refresh) return
+  await withAuthLock(async () => {
+    const auth = await readAuthAnthropic()
+    if (!auth?.refresh) return
 
-  let token: AuthToken = { refresh: auth.refresh, access: auth.access, expires: auth.expires }
-  if (isStale(token)) {
-    token = await refreshToken(token.refresh)
-    await writeAuthAnthropic(token)
-  }
+    let token: AuthToken = { refresh: auth.refresh, access: auth.access, expires: auth.expires }
+    if (isStale(token)) {
+      token = await refreshToken(token.refresh)
+      await writeAuthAnthropic(token)
+    }
 
-  const profile = await fetchProfile(token.access!)
-  await upsertAccount(profile.uuid, profile.email, token)
+    const profile = await fetchProfile(token.access!)
+    await upsertAccount(profile.uuid, profile.email, token)
+  })
 }
 
 async function ensureFresh(account: StoredAccount): Promise<{ access?: string; updated?: StoredAccount }> {
@@ -90,32 +92,37 @@ export async function collectAllUsage(): Promise<{ activeId?: string; results: A
     }),
   )
 
-  let mutated = false
-  settled.forEach((entry, index) => {
-    if (entry.updated) {
-      file.accounts[index] = entry.updated
-      mutated = true
-    }
-  })
-  if (mutated) await saveAccounts(file)
+  const updated = settled.flatMap((entry) => (entry.updated ? [entry.updated] : []))
+  if (updated.length > 0) {
+    await withAuthLock(async () => {
+      const current = await loadAccounts()
+      for (const account of updated) {
+        const index = current.accounts.findIndex((existing) => existing.id === account.id)
+        if (index >= 0) current.accounts[index] = { ...current.accounts[index], ...account }
+      }
+      await saveAccounts(current)
+    })
+  }
 
   return { activeId: file.activeId, results: settled.map((entry) => entry.result) }
 }
 
 export async function switchToAccount(id: string): Promise<StoredAccount> {
-  const file = await loadAccounts()
-  const index = file.accounts.findIndex((account) => account.id === id)
-  if (index < 0) throw new Error("account not found")
+  return withAuthLock(async () => {
+    const file = await loadAccounts()
+    const index = file.accounts.findIndex((account) => account.id === id)
+    if (index < 0) throw new Error("account not found")
 
-  let account = file.accounts[index]
-  if (isStale(account)) {
-    const fresh = await refreshToken(account.refresh)
-    account = { ...account, ...fresh }
-    file.accounts[index] = account
-  }
+    let account = file.accounts[index]
+    if (isStale(account)) {
+      const fresh = await refreshToken(account.refresh)
+      account = { ...account, ...fresh }
+      file.accounts[index] = account
+    }
 
-  file.activeId = id
-  await saveAccounts(file)
-  await writeAuthAnthropic({ refresh: account.refresh, access: account.access, expires: account.expires })
-  return account
+    file.activeId = id
+    await saveAccounts(file)
+    await writeAuthAnthropic({ refresh: account.refresh, access: account.access, expires: account.expires })
+    return account
+  })
 }

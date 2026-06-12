@@ -62,6 +62,23 @@ async function resolveAuthJsonPath(): Promise<string> {
   return candidates[0]
 }
 
+// Serializes auth.json / claude-accounts.json read-modify-writes. NOT reentrant:
+// never nest withAuthLock inside another withAuthLock or it deadlocks.
+let authLock: Promise<unknown> = Promise.resolve()
+
+export function withAuthLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = authLock.then(fn, fn)
+  authLock = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  return run
+}
+
+export async function readActiveId(): Promise<string | undefined> {
+  return (await loadAccounts()).activeId
+}
+
 export async function loadAccounts(): Promise<AccountsFile> {
   const data = await readJson<Partial<AccountsFile>>(ACCOUNTS_PATH)
   return {
