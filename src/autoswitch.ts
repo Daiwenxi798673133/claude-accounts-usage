@@ -108,6 +108,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 function debugLog(tag: string, payload: unknown): void {
+  if (!process.env.CLAUDE_AUTOSWITCH_DEBUG) return
   let serialized: string
   try {
     serialized = JSON.stringify(payload)
