@@ -19,7 +19,7 @@
 
 工作方式:
 
-- **检测**:监听 OpenCode 的 `session.next.retried` / `session.error` 事件,只在 429 且命中 Anthropic 订阅额度签名(`anthropic-ratelimit-unified-*: rejected`,或响应体 `rate_limit_error` + 额度文案)时触发;瞬时限流、529 过载、401 鉴权错误都会被排除,避免误切号。
+- **检测**:主要监听 OpenCode 的 `session.status` 的 retry 事件(同时也注册 `session.next.retried` / `session.error` 作为补充,但 TUI 插件通常只能收到 `session.status`),只在命中 Anthropic 订阅额度签名(`anthropic-ratelimit-unified-*: rejected`,或响应体/消息含 `rate_limit_error` + 额度文案,或 429 状态码)时触发;529 过载等会被排除,避免误切号。
 - **选号**:优先按用量挑剩余额度最多的账号(用 `/usage` 时缓存的数据,TTL 10 分钟),无缓存则轮询下一个;跳过正在冷却(已知额度未恢复)的账号。
 - **重发**:切号后将会话回退到失败的那条用户消息并用新账号重发(`revert` + `promptAsync`)。注意:若该轮中途已产生文件改动,回退会一并撤销并整轮重做。
 - **冷却**:撞限的账号按响应头给出的 reset 时间(缺省 60 分钟)进入冷却,持久化在 `tui.json` 的 KV 中;账号下次成功使用后自动解除冷却。
@@ -87,7 +87,7 @@ cd claude-accounts-usage && bun install
 ## 已知限制
 
 - ex-machina 同一时刻只持有一个账号,所以一个新账号必须先用 ex-machina 登录过一次,插件才能在下次加载/操作时收录它。
-- 自动切号依赖 OpenCode 的 `session.error` / `session.next.retried` 事件,因此只对经由 OpenCode(及 ex-machina)发出的 Anthropic 请求生效;额度恢复后的解除冷却需要该账号成功跑过一次对话。
+- 自动切号依赖 OpenCode 的 `session.status` 事件(辅以 `session.next.retried` / `session.error`),因此只对经由 OpenCode(及 ex-machina)发出的 Anthropic 请求生效;额度恢复后的解除冷却需要该账号成功跑过一次对话。
 
 ## License
 
