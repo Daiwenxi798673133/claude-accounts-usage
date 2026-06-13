@@ -1,7 +1,7 @@
 import { createSignal } from "solid-js"
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { loadAccounts } from "./src/accounts.ts"
-import { autoCapture, collectAllUsage, startTokenKeeper, stopTokenKeeper, switchToAccount } from "./src/usage.ts"
+import { autoCapture, collectAllUsage, switchToAccount } from "./src/usage.ts"
 import { installAutoSwitch } from "./src/autoswitch.ts"
 import { openSwitchDialog, openUsageDialog, type UsageState } from "./src/dialogs.tsx"
 
@@ -15,10 +15,7 @@ const tui: TuiPlugin = async (api) => {
   const [state, setState] = createSignal<UsageState>({ loading: false, results: [] })
 
   const autoSwitch = installAutoSwitch(api)
-  api.lifecycle.onDispose(() => {
-    stopTokenKeeper()
-    autoSwitch.dispose()
-  })
+  api.lifecycle.onDispose(autoSwitch.dispose)
 
   const refreshUsage = async () => {
     try {
@@ -32,7 +29,6 @@ const tui: TuiPlugin = async (api) => {
   }
 
   void autoCapture().catch(() => undefined)
-  startTokenKeeper()
 
   const command = api.command
   if (!command) {
