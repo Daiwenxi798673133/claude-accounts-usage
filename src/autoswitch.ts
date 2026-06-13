@@ -1,8 +1,6 @@
-import { appendFile } from "node:fs/promises"
-import { homedir } from "node:os"
-import { join } from "node:path"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { loadAccounts, readActiveId, type AccountsFile, type StoredAccount } from "./accounts.ts"
+import { debugLog } from "./debug.ts"
 import { collectAllUsage, switchToAccount, type AccountUsage, type UsageResponse } from "./usage.ts"
 
 const ENABLED = true
@@ -105,18 +103,6 @@ function fmtDuration(ms: number): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-function debugLog(tag: string, payload: unknown): void {
-  if (!process.env.CLAUDE_AUTOSWITCH_DEBUG) return
-  let serialized: string
-  try {
-    serialized = JSON.stringify(payload)
-  } catch {
-    serialized = String(payload)
-  }
-  const line = `${new Date().toISOString()} [${tag}] ${serialized}\n`
-  void appendFile(join(homedir(), ".config", "opencode", "claude-autoswitch.log"), line).catch(() => undefined)
 }
 
 export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {

@@ -1,6 +1,7 @@
 import type { AuthToken, StoredAccount } from "./accounts.ts"
 import { loadAccounts, readAuthAnthropic, saveAccounts, upsertAccount, withAuthLock, writeAuthAnthropic } from "./accounts.ts"
 import { CLIENT_ID, OAUTH_BETA, TOKEN_EXPIRY_BUFFER_MS, TOKEN_URL, USAGE_ENDPOINT } from "./constants.ts"
+import { debugLog } from "./debug.ts"
 import { fetchProfile } from "./profile.ts"
 
 export type UsageWindow = { utilization: number; resets_at?: string }
@@ -34,7 +35,15 @@ export async function refreshToken(refresh: string): Promise<{ access: string; r
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ grant_type: "refresh_token", refresh_token: refresh, client_id: CLIENT_ID }),
   })
-  if (!res.ok) throw new Error(`token refresh failed (${res.status})`)
+  if (!res.ok) {
+    const body = await res.text().catch(() => "")
+    const headers: Record<string, string> = {}
+    res.headers.forEach((value, key) => {
+      headers[key] = value
+    })
+    debugLog("refresh-failed", { status: res.status, headers, body: body.slice(0, 800) }, true)
+    throw new Error(`token refresh failed (${res.status})`)
+  }
   const json = (await res.json()) as { access_token: string; refresh_token: string; expires_in: number }
   return {
     access: json.access_token,
