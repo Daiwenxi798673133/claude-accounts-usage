@@ -3,7 +3,7 @@
 // by that plugin are accepted by the refresh endpoint below.
 export const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
-export const TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+export const TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 
 export const USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 
