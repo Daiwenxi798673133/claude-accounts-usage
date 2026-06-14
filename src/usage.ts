@@ -1,6 +1,6 @@
 import type { AuthToken, StoredAccount } from "./accounts.ts"
 import { loadAccounts, readAuthAnthropic, saveAccounts, upsertAccount, withAuthLock, writeAuthAnthropic } from "./accounts.ts"
-import { CLIENT_ID, OAUTH_BETA, TOKEN_EXPIRY_BUFFER_MS, TOKEN_URL, USAGE_ENDPOINT } from "./constants.ts"
+import { CLIENT_ID, INACTIVE_REFRESH_THRESHOLD_MS, OAUTH_BETA, TOKEN_EXPIRY_BUFFER_MS, TOKEN_URL, USAGE_ENDPOINT } from "./constants.ts"
 import { debugLog } from "./debug.ts"
 import { fetchProfile } from "./profile.ts"
 
@@ -31,8 +31,8 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function isStale(token: { access?: string; expires?: number }): boolean {
-  return !token.access || !token.expires || token.expires < Date.now() + TOKEN_EXPIRY_BUFFER_MS
+function isStale(token: { access?: string; expires?: number }, bufferMs = TOKEN_EXPIRY_BUFFER_MS): boolean {
+  return !token.access || !token.expires || token.expires < Date.now() + bufferMs
 }
 
 function isRefresh429Cooldown(refresh: string): boolean {
@@ -48,7 +48,11 @@ function isRefresh429Cooldown(refresh: string): boolean {
 function doRefreshToken(refresh: string): Promise<{ access: string; refresh: string; expires: number }> {
   return fetch(TOKEN_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json, text/plain, */*",
+      "User-Agent": "axios/1.13.6",
+    },
     body: JSON.stringify({ grant_type: "refresh_token", refresh_token: refresh, client_id: CLIENT_ID }),
   }).then(async (res) => {
     if (!res.ok) {
@@ -109,8 +113,8 @@ export async function autoCapture(): Promise<void> {
   })
 }
 
-async function ensureFresh(account: StoredAccount): Promise<{ access?: string; updated?: StoredAccount }> {
-  if (!isStale(account)) return { access: account.access }
+async function ensureFresh(account: StoredAccount, bufferMs?: number): Promise<{ access?: string; updated?: StoredAccount }> {
+  if (!isStale(account, bufferMs)) return { access: account.access }
   if (isRefresh429Cooldown(account.refresh)) {
     debugLog("refresh-skip-429-cooldown", { label: account.label }, true)
     return { access: account.access }
@@ -131,8 +135,9 @@ export async function collectAllUsage(): Promise<{ activeId?: string; results: A
 
   for (const account of file.accounts) {
     const base = { id: account.id, label: account.label, active: account.id === file.activeId }
+    const bufferMs = account.id === file.activeId ? TOKEN_EXPIRY_BUFFER_MS : INACTIVE_REFRESH_THRESHOLD_MS
     try {
-      const { access, updated } = await ensureFresh(account)
+      const { access, updated } = await ensureFresh(account, bufferMs)
       if (updated) needsRefresh = true
       if (!access) {
         settled.push({ result: { ...base, error: "missing access token" }, updated })
