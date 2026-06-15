@@ -41,13 +41,13 @@ TUI 插件只在 `~/.config/opencode/tui.json` 配置,**不要**放进 `opencode
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["claude-accounts-usage@0.1.1"]
+  "plugin": ["claude-accounts-usage@0.1.2"]
 }
 ```
 
 OpenCode 会自动解析并安装该包,无需手动 `npm install`。
 
-> **建议带上版本号**(如 `@0.1.1`)。OpenCode 按"含版本号的包名"建独立缓存目录:写死版本号后,以后升级只需把后缀改成新版本号;若不带版本号,会被首次安装的版本锁住,发布新版也不会自动更新。
+> **建议带上版本号**(如 `@0.1.2`)。OpenCode 按"含版本号的包名"建独立缓存目录:写死版本号后,以后升级只需把后缀改成新版本号;若不带版本号,会被首次安装的版本锁住,发布新版也不会自动更新。
 
 ### 方式二:本地 clone(开发/离线)
 
