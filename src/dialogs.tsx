@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
-import { For, Show } from "solid-js"
+import { createMemo, createSignal, For, Show } from "solid-js"
+import { useKeyboard } from "@opentui/solid"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { StoredAccount } from "./accounts.ts"
 import type { AccountUsage, UsageWindow } from "./usage.ts"
@@ -115,24 +116,135 @@ export function openUsageDialog(api: TuiPluginApi, state: () => UsageState): voi
   api.ui.dialog.replace(() => <UsageDialog api={api} state={state} />)
 }
 
+function SwitchAccountRow(props: {
+  api: TuiPluginApi
+  account: StoredAccount
+  activeId?: string
+  usage?: AccountUsage
+  selected: boolean
+  loading: boolean
+}) {
+  const theme = () => props.api.theme.current
+  const isActive = () => props.account.id === props.activeId
+  return (
+    <box flexDirection="column">
+      <box flexDirection="row" gap={1}>
+        <text fg={props.selected ? theme().primary : theme().textMuted}>{props.selected ? "▶" : " "}</text>
+        <text fg={props.selected ? theme().primary : theme().text}>
+          {isActive() ? "●" : "○"} {props.account.label}
+          {isActive() ? " (当前)" : ""}
+        </text>
+      </box>
+      <box flexDirection="column" paddingLeft={4}>
+        <Show when={props.usage?.error}>
+          <text fg={theme().error}>{props.usage!.error}</text>
+        </Show>
+        <Show when={props.usage?.usage}>
+          {(usage) => (
+            <box flexDirection="column">
+              <WindowRow api={props.api} name="5h" win={usage().five_hour} />
+              <WindowRow api={props.api} name="7d" win={usage().seven_day} />
+              <WindowRow api={props.api} name="Sonnet" win={usage().seven_day_sonnet} />
+            </box>
+          )}
+        </Show>
+        <Show when={props.loading && !props.usage?.usage && !props.usage?.error}>
+          <text fg={theme().textMuted}>加载中…</text>
+        </Show>
+      </box>
+    </box>
+  )
+}
+
+function SwitchDialog(props: {
+  api: TuiPluginApi
+  accounts: StoredAccount[]
+  activeId?: string
+  state: () => UsageState
+  onSwitch: (id: string) => void
+}) {
+  const api = props.api
+  const theme = () => api.theme.current
+  const accounts = props.accounts
+  const start = accounts.findIndex((account) => account.id === props.activeId)
+  const [index, setIndex] = createSignal(start < 0 ? 0 : start)
+
+  const usageById = createMemo(() => {
+    const map = new Map<string, AccountUsage>()
+    for (const result of props.state().results) map.set(result.id, result)
+    return map
+  })
+
+  function move(delta: number): void {
+    setIndex((i) => Math.max(0, Math.min(accounts.length - 1, i + delta)))
+  }
+
+  function confirm(): void {
+    const account = accounts[index()]
+    if (!account) return
+    api.ui.dialog.clear()
+    props.onSwitch(account.id)
+  }
+
+  useKeyboard((evt) => {
+    if (evt.name === "return") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      confirm()
+      return
+    }
+    if (evt.name === "up" || evt.name === "k") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      move(-1)
+      return
+    }
+    if (evt.name === "down" || evt.name === "j") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      move(1)
+    }
+  })
+
+  return (
+    <box paddingTop={1} paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1} flexDirection="column">
+      <box flexDirection="row" justifyContent="space-between">
+        <text fg={theme().text}>
+          <b>切换 Claude 账号</b>
+        </text>
+        <text fg={theme().textMuted}>↑↓ 选择 · enter 切换 · esc 关闭</text>
+      </box>
+      <For each={accounts}>
+        {(account, i) => (
+          <SwitchAccountRow
+            api={api}
+            account={account}
+            activeId={props.activeId}
+            usage={usageById().get(account.id)}
+            selected={i() === index()}
+            loading={props.state().loading}
+          />
+        )}
+      </For>
+      <Show when={props.state().error}>
+        <text fg={theme().error}>{props.state().error}</text>
+      </Show>
+      <Show when={props.state().updatedAt}>
+        <text fg={theme().textMuted}>更新于 {clockTime(props.state().updatedAt!)}</text>
+      </Show>
+    </box>
+  )
+}
+
 export function openSwitchDialog(
   api: TuiPluginApi,
   accounts: StoredAccount[],
   activeId: string | undefined,
+  state: () => UsageState,
   onSwitch: (id: string) => void | Promise<void>,
 ): void {
-  api.ui.dialog.replace(() =>
-    api.ui.DialogSelect<string>({
-      title: "切换 Claude 账号",
-      current: activeId,
-      options: accounts.map((account) => ({
-        title: account.id === activeId ? `${account.label} (当前)` : account.label,
-        value: account.id,
-      })),
-      onSelect: (option) => {
-        api.ui.dialog.clear()
-        void onSwitch(option.value)
-      },
-    }),
-  )
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() => (
+    <SwitchDialog api={api} accounts={accounts} activeId={activeId} state={state} onSwitch={(id) => void onSwitch(id)} />
+  ))
 }

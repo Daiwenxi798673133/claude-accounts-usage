@@ -60,7 +60,8 @@ const tui: TuiPlugin = async (api) => {
           api.ui.toast({ variant: "warning", message: "没有账号。请先用 ex-machina 登录 Claude" })
           return
         }
-        openSwitchDialog(api, file.accounts, file.activeId, async (id) => {
+        setState((prev) => ({ ...prev, loading: true, error: undefined }))
+        openSwitchDialog(api, file.accounts, file.activeId, state, async (id) => {
           try {
             const account = await switchToAccount(id)
             api.ui.toast({ variant: "success", message: `已切换到 ${account.label},下次对话生效` })
@@ -68,6 +69,7 @@ const tui: TuiPlugin = async (api) => {
             api.ui.toast({ variant: "error", message: `切换失败: ${message(error)}` })
           }
         })
+        void refreshUsage()
       },
     },
   ])
