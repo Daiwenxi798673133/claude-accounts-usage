@@ -8,10 +8,9 @@
 
 | 命令 | 作用 |
 |------|------|
-| `/usage` | 弹框显示所有账号的用量(5h / 7d / 7d-Sonnet 三个窗口,带进度条与重置倒计时) |
-| `/switch` | 弹框选择账号并切换(立即生效);列表内联显示每个账号的 5h / 7d / 7d-Sonnet 用量,`↑↓` 选择、`enter` 切换、`esc` 关闭 |
+| `/usage` | 弹框显示所有账号的用量(5h / 7d / 7d-Sonnet 三个窗口,带进度条与重置倒计时),并可直接切号:`↑↓` 选择、`enter` 切换(立即生效)、`esc` 关闭 |
 
-账号会在**插件加载时**以及每次 `/usage`、`/switch` 时**自动收录**当前 ex-machina 登录的账号,无需手动添加。
+账号会在**插件加载时**以及每次 `/usage` 时**自动收录**当前 ex-machina 登录的账号,无需手动添加。
 
 ## 限流自动切号(自动重试)
 
@@ -41,13 +40,13 @@ TUI 插件只在 `~/.config/opencode/tui.json` 配置,**不要**放进 `opencode
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["claude-accounts-usage@0.1.3"]
+  "plugin": ["claude-accounts-usage@0.1.4"]
 }
 ```
 
 OpenCode 会自动解析并安装该包,无需手动 `npm install`。
 
-> **建议带上版本号**(如 `@0.1.3`)。OpenCode 按"含版本号的包名"建独立缓存目录:写死版本号后,以后升级只需把后缀改成新版本号;若不带版本号,会被首次安装的版本锁住,发布新版也不会自动更新。
+> **建议带上版本号**(如 `@0.1.4`)。OpenCode 按"含版本号的包名"建独立缓存目录:写死版本号后,以后升级只需把后缀改成新版本号;若不带版本号,会被首次安装的版本锁住,发布新版也不会自动更新。
 
 ### 方式二:本地 clone(开发/离线)
 
@@ -71,8 +70,8 @@ cd claude-accounts-usage && bun install
 
 1. 用 ex-machina 登录账号 A:`opencode auth login` → Claude Pro/Max。
 2. 打开 OpenCode,插件自动收录账号 A(标签为其邮箱)。
-3. 想加更多账号:用 ex-machina 登录账号 B,然后重新打开 OpenCode 或运行一次 `/usage` / `/switch`,插件自动收录 B。
-4. 之后用 `/switch` 在账号间切换,用 `/usage` 查看全部用量。
+3. 想加更多账号:用 ex-machina 登录账号 B,然后重新打开 OpenCode 或运行一次 `/usage`,插件自动收录 B。
+4. 之后用 `/usage` 查看全部用量,并在面板里 `↑↓` 选号、`enter` 切换。
 
 > 标签默认是账号邮箱。想改名?直接编辑 `~/.config/opencode/claude-accounts.json` 里对应账号的 `label`(自动收录不会覆盖你改过的标签)。
 

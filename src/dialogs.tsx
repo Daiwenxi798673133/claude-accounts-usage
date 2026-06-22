@@ -62,61 +62,7 @@ function WindowRow(props: { api: TuiPluginApi; name: string; win?: UsageWindow }
   )
 }
 
-function AccountBlock(props: { api: TuiPluginApi; item: AccountUsage }) {
-  const theme = () => props.api.theme.current
-  return (
-    <box flexDirection="column">
-      <text fg={theme().text}>
-        {props.item.active ? "●" : "○"} {props.item.label}
-        {props.item.active ? " (当前)" : ""}
-      </text>
-      <Show when={props.item.error}>
-        <text fg={theme().error}>  {props.item.error}</text>
-      </Show>
-      <Show when={props.item.usage}>
-        {(usage) => (
-          <box flexDirection="column" paddingLeft={2}>
-            <WindowRow api={props.api} name="5h" win={usage().five_hour} />
-            <WindowRow api={props.api} name="7d" win={usage().seven_day} />
-            <WindowRow api={props.api} name="Sonnet" win={usage().seven_day_sonnet} />
-          </box>
-        )}
-      </Show>
-    </box>
-  )
-}
-
-function UsageDialog(props: { api: TuiPluginApi; state: () => UsageState }) {
-  const api = props.api
-  const theme = () => api.theme.current
-  return (
-    <box paddingTop={1} paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1} flexDirection="column">
-      <box flexDirection="row" justifyContent="space-between">
-        <text fg={theme().text}>
-          <b>Claude 账号用量</b>
-        </text>
-        <text fg={theme().textMuted}>esc 关闭</text>
-      </box>
-      <Show when={props.state().loading && props.state().results.length === 0}>
-        <text fg={theme().textMuted}>加载中…</text>
-      </Show>
-      <Show when={props.state().error}>
-        <text fg={theme().error}>{props.state().error}</text>
-      </Show>
-      <For each={props.state().results}>{(item) => <AccountBlock api={api} item={item} />}</For>
-      <Show when={props.state().updatedAt}>
-        <text fg={theme().textMuted}>更新于 {clockTime(props.state().updatedAt!)}</text>
-      </Show>
-    </box>
-  )
-}
-
-export function openUsageDialog(api: TuiPluginApi, state: () => UsageState): void {
-  api.ui.dialog.setSize("medium")
-  api.ui.dialog.replace(() => <UsageDialog api={api} state={state} />)
-}
-
-function SwitchAccountRow(props: {
+function AccountRow(props: {
   api: TuiPluginApi
   account: StoredAccount
   activeId?: string
@@ -156,7 +102,7 @@ function SwitchAccountRow(props: {
   )
 }
 
-function SwitchDialog(props: {
+function AccountsPanel(props: {
   api: TuiPluginApi
   accounts: StoredAccount[]
   activeId?: string
@@ -210,13 +156,13 @@ function SwitchDialog(props: {
     <box paddingTop={1} paddingBottom={1} paddingLeft={2} paddingRight={2} gap={1} flexDirection="column">
       <box flexDirection="row" justifyContent="space-between">
         <text fg={theme().text}>
-          <b>切换 Claude 账号</b>
+          <b>Claude 账号用量</b>
         </text>
         <text fg={theme().textMuted}>↑↓ 选择 · enter 切换 · esc 关闭</text>
       </box>
       <For each={accounts}>
         {(account, i) => (
-          <SwitchAccountRow
+          <AccountRow
             api={api}
             account={account}
             activeId={props.activeId}
@@ -236,7 +182,7 @@ function SwitchDialog(props: {
   )
 }
 
-export function openSwitchDialog(
+export function openUsageDialog(
   api: TuiPluginApi,
   accounts: StoredAccount[],
   activeId: string | undefined,
@@ -245,6 +191,6 @@ export function openSwitchDialog(
 ): void {
   api.ui.dialog.setSize("medium")
   api.ui.dialog.replace(() => (
-    <SwitchDialog api={api} accounts={accounts} activeId={activeId} state={state} onSwitch={(id) => void onSwitch(id)} />
+    <AccountsPanel api={api} accounts={accounts} activeId={activeId} state={state} onSwitch={(id) => void onSwitch(id)} />
   ))
 }
