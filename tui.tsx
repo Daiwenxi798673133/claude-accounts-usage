@@ -1,6 +1,6 @@
 import { createSignal } from "solid-js"
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { loadAccounts } from "./src/accounts.ts"
+import { loadAccounts, removeAccount } from "./src/accounts.ts"
 import { autoCapture, collectAllUsage, switchToAccount } from "./src/usage.ts"
 import { installAutoSwitch } from "./src/autoswitch.ts"
 import { openUsageDialog, type UsageState } from "./src/dialogs.tsx"
@@ -50,14 +50,29 @@ const tui: TuiPlugin = async (api) => {
           return
         }
         setState((prev) => ({ ...prev, loading: true, error: undefined }))
-        openUsageDialog(api, file.accounts, file.activeId, state, async (id) => {
-          try {
-            const account = await switchToAccount(id)
-            api.ui.toast({ variant: "success", message: `已切换到 ${account.label},下次对话生效` })
-          } catch (error) {
-            api.ui.toast({ variant: "error", message: `切换失败: ${message(error)}` })
-          }
-        })
+        openUsageDialog(
+          api,
+          file.accounts,
+          file.activeId,
+          state,
+          async (id) => {
+            try {
+              const account = await switchToAccount(id)
+              api.ui.toast({ variant: "success", message: `已切换到 ${account.label},下次对话生效` })
+            } catch (error) {
+              api.ui.toast({ variant: "error", message: `切换失败: ${message(error)}` })
+            }
+          },
+          async (id) => {
+            try {
+              const removed = await removeAccount(id)
+              if (removed) api.ui.toast({ variant: "success", message: `已删除账号 ${removed.label}` })
+              void refreshUsage()
+            } catch (error) {
+              api.ui.toast({ variant: "error", message: `删除失败: ${message(error)}` })
+            }
+          },
+        )
         void refreshUsage()
       },
     },

@@ -139,3 +139,18 @@ export async function setActiveId(id: string): Promise<void> {
   file.activeId = id
   await saveAccounts(file)
 }
+
+// Removes an account from claude-accounts.json only. Deliberately does NOT touch
+// auth.json: ex-machina owns that file, and the active account would just be
+// re-captured by autoCapture anyway — callers must block deleting the active one.
+export async function removeAccount(id: string): Promise<StoredAccount | undefined> {
+  return withAuthLock(async () => {
+    const file = await loadAccounts()
+    const index = file.accounts.findIndex((account) => account.id === id)
+    if (index < 0) return undefined
+    const [removed] = file.accounts.splice(index, 1)
+    if (file.activeId === id) file.activeId = undefined
+    await saveAccounts(file)
+    return removed
+  })
+}
