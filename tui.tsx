@@ -3,7 +3,7 @@ import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { loadAccounts } from "./src/accounts.ts"
 import { autoCapture, collectAllUsage, switchToAccount } from "./src/usage.ts"
 import { installAutoSwitch } from "./src/autoswitch.ts"
-import { openSwitchDialog, openUsageDialog, type UsageState } from "./src/dialogs.tsx"
+import { openUsageDialog, type UsageState } from "./src/dialogs.tsx"
 
 const ID = "claude-accounts-usage"
 
@@ -38,21 +38,10 @@ const tui: TuiPlugin = async (api) => {
 
   command.register(() => [
     {
-      title: "Claude: 查看账号用量",
+      title: "Claude: 查看账号用量并切换",
       value: `${ID}.usage`,
       category: "Claude",
       slash: { name: "usage" },
-      onSelect: () => {
-        setState((prev) => ({ ...prev, loading: true, error: undefined }))
-        openUsageDialog(api, state)
-        void refreshUsage()
-      },
-    },
-    {
-      title: "Claude: 切换账号",
-      value: `${ID}.switch`,
-      category: "Claude",
-      slash: { name: "switch" },
       onSelect: async () => {
         await autoCapture().catch(() => undefined)
         const file = await loadAccounts()
@@ -61,7 +50,7 @@ const tui: TuiPlugin = async (api) => {
           return
         }
         setState((prev) => ({ ...prev, loading: true, error: undefined }))
-        openSwitchDialog(api, file.accounts, file.activeId, state, async (id) => {
+        openUsageDialog(api, file.accounts, file.activeId, state, async (id) => {
           try {
             const account = await switchToAccount(id)
             api.ui.toast({ variant: "success", message: `已切换到 ${account.label},下次对话生效` })
