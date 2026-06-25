@@ -34,6 +34,7 @@
   "files": [
     "tui.tsx",
     "src",
+    "!src/**/*.test.ts",
     "README.md",
     "LICENSE"
   ],
