@@ -3,7 +3,7 @@ import { createMemo, createSignal, For, Show } from "solid-js"
 import { useKeyboard } from "@opentui/solid"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { StoredAccount } from "./accounts.ts"
-import type { AccountUsage, UsageWindow } from "./usage.ts"
+import type { AccountUsage, UsageResponse, UsageWindow } from "./usage.ts"
 
 export type UsageState = {
   loading: boolean
@@ -43,7 +43,7 @@ function clockTime(ts: number): string {
   return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
 }
 
-function WindowRow(props: { api: TuiPluginApi; name: string; win?: UsageWindow }) {
+function WindowRow(props: { api: TuiPluginApi; name: string; win?: UsageWindow | null }) {
   const theme = () => props.api.theme.current
   return (
     <Show when={props.win}>
@@ -60,6 +60,11 @@ function WindowRow(props: { api: TuiPluginApi; name: string; win?: UsageWindow }
       )}
     </Show>
   )
+}
+
+function ModelWindowRow(props: { api: TuiPluginApi; usage: () => UsageResponse }) {
+  const opus = () => props.usage().seven_day_opus
+  return <WindowRow api={props.api} name={opus() ? "Opus" : "Sonnet"} win={opus() ?? props.usage().seven_day_sonnet} />
 }
 
 function AccountRow(props: {
@@ -94,7 +99,7 @@ function AccountRow(props: {
             <box flexDirection="column">
               <WindowRow api={props.api} name="5h" win={usage().five_hour} />
               <WindowRow api={props.api} name="7d" win={usage().seven_day} />
-              <WindowRow api={props.api} name="Sonnet" win={usage().seven_day_sonnet} />
+              <ModelWindowRow api={props.api} usage={usage} />
             </box>
           )}
         </Show>

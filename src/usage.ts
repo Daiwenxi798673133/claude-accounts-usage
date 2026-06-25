@@ -12,11 +12,14 @@ const refresh429Cooldown = new Map<string, number>()
 
 export type UsageWindow = { utilization: number; resets_at?: string }
 
+// Windows the account doesn't have come back as `null`, not omitted. There's no
+// dedicated Sonnet weekly limit (Anthropic tracks overall `seven_day` + Opus-only
+// `seven_day_opus`), so `seven_day_sonnet` is null for most accounts.
 export type UsageResponse = {
-  five_hour?: UsageWindow
-  seven_day?: UsageWindow
-  seven_day_sonnet?: UsageWindow
-  seven_day_opus?: UsageWindow
+  five_hour?: UsageWindow | null
+  seven_day?: UsageWindow | null
+  seven_day_sonnet?: UsageWindow | null
+  seven_day_opus?: UsageWindow | null
 }
 
 export type AccountUsage = {
