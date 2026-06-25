@@ -1,9 +1,11 @@
 import { createSignal } from "solid-js"
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { loadAccounts } from "./src/accounts.ts"
+import { loadAccounts, removeAccount } from "./src/accounts.ts"
 import { autoCapture, collectAllUsage, switchToAccount } from "./src/usage.ts"
 import { installAutoSwitch } from "./src/autoswitch.ts"
 import { openUsageDialog, type UsageState } from "./src/dialogs.tsx"
+import { aggregate, loadRows, type RawRow, type TimeRange } from "./src/stats.ts"
+import { openStatsDialog, type StatsState } from "./src/stats-dialog.tsx"
 
 const ID = "claude-accounts-usage"
 
@@ -13,9 +15,33 @@ function message(error: unknown): string {
 
 const tui: TuiPlugin = async (api) => {
   const [state, setState] = createSignal<UsageState>({ loading: false, results: [] })
+  const [statsState, setStatsState] = createSignal<StatsState>({ loading: false })
 
   const autoSwitch = installAutoSwitch(api)
   api.lifecycle.onDispose(autoSwitch.dispose)
+
+  let statsRows: RawRow[] | undefined
+  let statsSeq = 0
+  const reloadStats = async (range: TimeRange) => {
+    if (statsRows) {
+      try {
+        setStatsState({ loading: false, data: aggregate(statsRows, range) })
+      } catch (error) {
+        setStatsState({ loading: false, error: message(error) })
+      }
+      return
+    }
+    const seq = ++statsSeq
+    setStatsState({ loading: true })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    try {
+      const rows = loadRows()
+      statsRows = rows
+      if (seq === statsSeq) setStatsState({ loading: false, data: aggregate(rows, range) })
+    } catch (error) {
+      if (seq === statsSeq) setStatsState({ loading: false, error: message(error) })
+    }
+  }
 
   const refreshUsage = async () => {
     try {
@@ -50,15 +76,42 @@ const tui: TuiPlugin = async (api) => {
           return
         }
         setState((prev) => ({ ...prev, loading: true, error: undefined }))
-        openUsageDialog(api, file.accounts, file.activeId, state, async (id) => {
-          try {
-            const account = await switchToAccount(id)
-            api.ui.toast({ variant: "success", message: `已切换到 ${account.label},下次对话生效` })
-          } catch (error) {
-            api.ui.toast({ variant: "error", message: `切换失败: ${message(error)}` })
-          }
-        })
+        openUsageDialog(
+          api,
+          file.accounts,
+          file.activeId,
+          state,
+          async (id) => {
+            try {
+              const account = await switchToAccount(id)
+              api.ui.toast({ variant: "success", message: `已切换到 ${account.label},下次对话生效` })
+            } catch (error) {
+              api.ui.toast({ variant: "error", message: `切换失败: ${message(error)}` })
+            }
+          },
+          async (id) => {
+            try {
+              const removed = await removeAccount(id)
+              if (removed) api.ui.toast({ variant: "success", message: `已删除账号 ${removed.label}` })
+              void refreshUsage()
+            } catch (error) {
+              api.ui.toast({ variant: "error", message: `删除失败: ${message(error)}` })
+            }
+          },
+        )
         void refreshUsage()
+      },
+    },
+    {
+      title: "Claude: 查看 OpenCode 用量统计",
+      value: `${ID}.stats`,
+      category: "Claude",
+      slash: { name: "stats" },
+      onSelect: async () => {
+        statsRows = undefined
+        setStatsState({ loading: true })
+        openStatsDialog(api, statsState, (range) => void reloadStats(range))
+        await reloadStats("all")
       },
     },
   ])

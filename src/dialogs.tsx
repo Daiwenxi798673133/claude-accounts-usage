@@ -3,7 +3,7 @@ import { createMemo, createSignal, For, Show } from "solid-js"
 import { useKeyboard } from "@opentui/solid"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { StoredAccount } from "./accounts.ts"
-import type { AccountUsage, UsageWindow } from "./usage.ts"
+import type { AccountUsage, UsageResponse, UsageWindow } from "./usage.ts"
 
 export type UsageState = {
   loading: boolean
@@ -43,7 +43,7 @@ function clockTime(ts: number): string {
   return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
 }
 
-function WindowRow(props: { api: TuiPluginApi; name: string; win?: UsageWindow }) {
+function WindowRow(props: { api: TuiPluginApi; name: string; win?: UsageWindow | null }) {
   const theme = () => props.api.theme.current
   return (
     <Show when={props.win}>
@@ -62,6 +62,11 @@ function WindowRow(props: { api: TuiPluginApi; name: string; win?: UsageWindow }
   )
 }
 
+function ModelWindowRow(props: { api: TuiPluginApi; usage: () => UsageResponse }) {
+  const opus = () => props.usage().seven_day_opus
+  return <WindowRow api={props.api} name={opus() ? "Opus" : "Sonnet"} win={opus() ?? props.usage().seven_day_sonnet} />
+}
+
 function AccountRow(props: {
   api: TuiPluginApi
   account: StoredAccount
@@ -69,6 +74,7 @@ function AccountRow(props: {
   usage?: AccountUsage
   selected: boolean
   loading: boolean
+  pendingDelete: boolean
 }) {
   const theme = () => props.api.theme.current
   const isActive = () => props.account.id === props.activeId
@@ -80,6 +86,9 @@ function AccountRow(props: {
           {isActive() ? "●" : "○"} {props.account.label}
           {isActive() ? " (当前)" : ""}
         </text>
+        <Show when={props.pendingDelete}>
+          <text fg={theme().error}>确认删除? 再按 d · 其他键取消</text>
+        </Show>
       </box>
       <box flexDirection="column" paddingLeft={4}>
         <Show when={props.usage?.error}>
@@ -90,7 +99,7 @@ function AccountRow(props: {
             <box flexDirection="column">
               <WindowRow api={props.api} name="5h" win={usage().five_hour} />
               <WindowRow api={props.api} name="7d" win={usage().seven_day} />
-              <WindowRow api={props.api} name="Sonnet" win={usage().seven_day_sonnet} />
+              <ModelWindowRow api={props.api} usage={usage} />
             </box>
           )}
         </Show>
@@ -108,12 +117,14 @@ function AccountsPanel(props: {
   activeId?: string
   state: () => UsageState
   onSwitch: (id: string) => void
+  onDelete: (id: string) => void
 }) {
   const api = props.api
   const theme = () => api.theme.current
-  const accounts = props.accounts
-  const start = accounts.findIndex((account) => account.id === props.activeId)
+  const [accounts, setAccounts] = createSignal(props.accounts)
+  const start = props.accounts.findIndex((account) => account.id === props.activeId)
   const [index, setIndex] = createSignal(start < 0 ? 0 : start)
+  const [pendingDelete, setPendingDelete] = createSignal(false)
 
   const usageById = createMemo(() => {
     const map = new Map<string, AccountUsage>()
@@ -122,20 +133,53 @@ function AccountsPanel(props: {
   })
 
   function move(delta: number): void {
-    setIndex((i) => Math.max(0, Math.min(accounts.length - 1, i + delta)))
+    setPendingDelete(false)
+    setIndex((i) => Math.max(0, Math.min(accounts().length - 1, i + delta)))
   }
 
   function confirm(): void {
-    const account = accounts[index()]
+    const account = accounts()[index()]
     if (!account) return
     api.ui.dialog.clear()
     props.onSwitch(account.id)
   }
 
+  function requestDelete(): void {
+    const account = accounts()[index()]
+    if (!account) return
+    if (account.id === props.activeId) {
+      api.ui.toast({ variant: "warning", message: "无法删除当前账号(会被自动重新收录)" })
+      return
+    }
+    setPendingDelete(true)
+  }
+
+  function performDelete(): void {
+    const account = accounts()[index()]
+    setPendingDelete(false)
+    if (!account || account.id === props.activeId) return
+    props.onDelete(account.id)
+    const next = accounts().filter((item) => item.id !== account.id)
+    if (next.length === 0) {
+      api.ui.dialog.clear()
+      return
+    }
+    setAccounts(next)
+    setIndex((i) => Math.min(i, next.length - 1))
+  }
+
   useKeyboard((evt) => {
+    if (evt.name === "d") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      if (pendingDelete()) performDelete()
+      else requestDelete()
+      return
+    }
     if (evt.name === "return") {
       evt.preventDefault()
       evt.stopPropagation()
+      setPendingDelete(false)
       confirm()
       return
     }
@@ -149,7 +193,9 @@ function AccountsPanel(props: {
       evt.preventDefault()
       evt.stopPropagation()
       move(1)
+      return
     }
+    setPendingDelete(false)
   })
 
   return (
@@ -158,9 +204,9 @@ function AccountsPanel(props: {
         <text fg={theme().text}>
           <b>Claude 账号用量</b>
         </text>
-        <text fg={theme().textMuted}>↑↓ 选择 · enter 切换 · esc 关闭</text>
+        <text fg={theme().textMuted}>↑↓ 选择 · enter 切换 · d 删除 · esc 关闭</text>
       </box>
-      <For each={accounts}>
+      <For each={accounts()}>
         {(account, i) => (
           <AccountRow
             api={api}
@@ -169,6 +215,7 @@ function AccountsPanel(props: {
             usage={usageById().get(account.id)}
             selected={i() === index()}
             loading={props.state().loading}
+            pendingDelete={pendingDelete() && i() === index()}
           />
         )}
       </For>
@@ -182,15 +229,34 @@ function AccountsPanel(props: {
   )
 }
 
+export function openRecoveryAlert(api: TuiPluginApi, labels: string[]): void {
+  if (labels.length === 0) return
+  const message =
+    labels.length === 1
+      ? `账号「${labels[0]}」额度应已恢复，可在 /usage 切回使用`
+      : `${labels.length} 个账号额度应已恢复：${labels.join("、")}`
+  const Alert = api.ui.DialogAlert
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() => <Alert title="额度恢复" message={message} onConfirm={() => api.ui.dialog.clear()} />)
+}
+
 export function openUsageDialog(
   api: TuiPluginApi,
   accounts: StoredAccount[],
   activeId: string | undefined,
   state: () => UsageState,
   onSwitch: (id: string) => void | Promise<void>,
+  onDelete: (id: string) => void | Promise<void>,
 ): void {
   api.ui.dialog.setSize("medium")
   api.ui.dialog.replace(() => (
-    <AccountsPanel api={api} accounts={accounts} activeId={activeId} state={state} onSwitch={(id) => void onSwitch(id)} />
+    <AccountsPanel
+      api={api}
+      accounts={accounts}
+      activeId={activeId}
+      state={state}
+      onSwitch={(id) => void onSwitch(id)}
+      onDelete={(id) => void onDelete(id)}
+    />
   ))
 }

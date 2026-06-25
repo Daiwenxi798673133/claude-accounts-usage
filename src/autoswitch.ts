@@ -1,6 +1,8 @@
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { loadAccounts, readActiveId, type AccountsFile, type StoredAccount } from "./accounts.ts"
 import { debugLog } from "./debug.ts"
+import { openRecoveryAlert } from "./dialogs.tsx"
+import { latestTurn } from "./turn.ts"
 import { collectAllUsage, switchToAccount, type AccountUsage, type UsageResponse } from "./usage.ts"
 
 const ENABLED = true
@@ -107,17 +109,18 @@ function sleep(ms: number): Promise<void> {
 
 export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   const cooldown = new Map<string, number>()
+  const recoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const pendingRecovered = new Map<string, string>()
+  let recoveryRetryTimer: ReturnType<typeof setTimeout> | undefined
   const attempted = new Map<string, Set<string>>()
   const sessionLocks = new Map<string, Promise<unknown>>()
   const repromptInFlight = new Set<string>()
   const lastAction = new Map<string, number>()
+  const lastHandledAssistantId = new Map<string, string>()
   const seen = new Set<string>()
   let usageCache: { at: number; byId: Map<string, UsageResponse> } = { at: 0, byId: new Map() }
   let refreshing = false
   let lastSwitch: { id?: string; sessionID?: string; at: number } = { at: 0 }
-
-  const stored = api.kv.get<Record<string, number>>(COOLDOWN_KV_KEY, {})
-  if (stored) for (const [id, until] of Object.entries(stored)) cooldown.set(id, until)
 
   function persistCooldown(): void {
     const now = Date.now()
@@ -126,18 +129,76 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     api.kv.set(COOLDOWN_KV_KEY, snapshot)
   }
 
-  function markCooldown(id: string, untilMs?: number): void {
-    cooldown.set(id, untilMs ?? Date.now() + DEFAULT_COOLDOWN_MS)
+  function scheduleRecovery(id: string, until: number): void {
+    const existing = recoveryTimers.get(id)
+    if (existing) clearTimeout(existing)
+    const timer = setTimeout(() => {
+      recoveryTimers.delete(id)
+      void announceRecovery(id)
+    }, Math.max(0, until - Date.now()))
+    recoveryTimers.set(id, timer)
+  }
+
+  // Estimated recovery only: the cooldown deadline comes from the rate-limit
+  // response (or a default), so an elapsed timer means the quota *should* be
+  // back — we don't re-hit the API to verify before announcing.
+  async function announceRecovery(id: string): Promise<void> {
+    const file = await loadAccounts()
+    const account = file.accounts.find((item) => item.id === id)
+    cooldown.delete(id)
     persistCooldown()
+    if (!account) return
+    pendingRecovered.set(id, account.label)
+    flushRecovered()
+  }
+
+  function flushRecovered(): void {
+    if (pendingRecovered.size === 0) return
+    if (api.ui.dialog.open) {
+      if (!recoveryRetryTimer) {
+        recoveryRetryTimer = setTimeout(() => {
+          recoveryRetryTimer = undefined
+          flushRecovered()
+        }, 3_000)
+      }
+      return
+    }
+    const labels = [...pendingRecovered.values()]
+    pendingRecovered.clear()
+    openRecoveryAlert(api, labels)
+    void refreshUsageInBackground()
+  }
+
+  function markCooldown(id: string, untilMs?: number): void {
+    const until = untilMs ?? Date.now() + DEFAULT_COOLDOWN_MS
+    cooldown.set(id, until)
+    persistCooldown()
+    scheduleRecovery(id, until)
   }
 
   function clearCooldown(id: string): void {
+    const timer = recoveryTimers.get(id)
+    if (timer) {
+      clearTimeout(timer)
+      recoveryTimers.delete(id)
+    }
+    pendingRecovered.delete(id)
     if (cooldown.delete(id)) persistCooldown()
   }
 
   function isCooled(id: string, now: number): boolean {
     const until = cooldown.get(id)
     return typeof until === "number" && until > now
+  }
+
+  const stored = api.kv.get<Record<string, number>>(COOLDOWN_KV_KEY, {})
+  if (stored) {
+    const now = Date.now()
+    for (const [id, until] of Object.entries(stored)) {
+      if (until <= now) continue
+      cooldown.set(id, until)
+      scheduleRecovery(id, until)
+    }
   }
 
   function setUsageCache(results: AccountUsage[]): void {
@@ -283,41 +344,20 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     return out
   }
 
-  function findFailedAssistant(messages: ReturnType<TuiPluginApi["state"]["session"]["messages"]>): AssistantMsg | undefined {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i]
-      if (message.role === "assistant" && message.error) return message
-    }
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i]
-      if (message.role === "assistant") return message
-    }
-    return undefined
-  }
-
-  function findUserMessage(
-    messages: ReturnType<TuiPluginApi["state"]["session"]["messages"]>,
-    failed?: AssistantMsg,
-  ): StateMessage | undefined {
-    if (failed?.parentID) {
-      const parent = messages.find((message) => message.id === failed.parentID && message.role === "user")
-      if (parent) return parent
-    }
-    const failedIndex = failed ? messages.findIndex((message) => message.id === failed.id) : messages.length
-    const from = (failedIndex < 0 ? messages.length : failedIndex) - 1
-    for (let i = from; i >= 0; i--) {
-      if (messages[i].role === "user") return messages[i]
-    }
-    return undefined
-  }
-
-  async function waitIdle(sessionID: string): Promise<void> {
+  async function waitIdle(sessionID: string): Promise<boolean> {
     const deadline = Date.now() + IDLE_WAIT_TIMEOUT_MS
     while (Date.now() < deadline) {
       const status = api.state.session.status(sessionID)
-      if (!status || status.type === "idle") return
+      if (!status || status.type === "idle") return true
       await sleep(IDLE_POLL_MS)
     }
+    return false
+  }
+
+  function turnWroteFiles(assistantID: string): boolean {
+    return api.state
+      .part(assistantID)
+      .some((part) => part.type === "patch" || (part.type === "tool" && part.state?.status === "completed"))
   }
 
   async function repromptFailedTurn(sessionID: string, abortFirst: boolean): Promise<void> {
@@ -332,19 +372,31 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
           // ignore: stream may already be settling
         }
       }
-      await waitIdle(sessionID)
+      // session.revert physically rolls back files after the boundary; only act once settled.
+      if (!(await waitIdle(sessionID))) return guidance()
 
       const messages = api.state.session.messages(sessionID)
-      const failed = findFailedAssistant(messages)
-      const userMessage = findUserMessage(messages, failed)
-      if (!userMessage) return guidance()
+      const turn = latestTurn(messages)
+      if (!turn) return guidance()
+      const { user, failed } = turn
 
-      const parts = toInputParts(api.state.part(userMessage.id))
+      if (lastHandledAssistantId.get(sessionID) === failed.id) return
+
+      const parts = toInputParts(api.state.part(user.id))
       if (parts.length === 0) return guidance()
 
-      const reverted = await api.client.session.revert({ sessionID, messageID: userMessage.id })
-      if (reverted.error) return guidance()
+      // revert would discard files this turn already wrote and a redo can't reproduce them — refuse.
+      if (turnWroteFiles(failed.id)) {
+        api.ui.toast({ variant: "warning", message: "已切换账号；上一轮已改动文件，未自动回退，请手动重发以免覆盖改动" })
+        return
+      }
 
+      lastHandledAssistantId.set(sessionID, failed.id)
+      const reverted = await api.client.session.revert({ sessionID, messageID: user.id })
+      if (reverted.error) {
+        lastHandledAssistantId.delete(sessionID)
+        return guidance()
+      }
       const prompted = await api.client.session.promptAsync({ sessionID, parts })
       if (prompted.error) guidance()
     } catch {
@@ -465,6 +517,9 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
           // ignore unsubscribe failures during teardown
         }
       }
+      for (const timer of recoveryTimers.values()) clearTimeout(timer)
+      recoveryTimers.clear()
+      if (recoveryRetryTimer) clearTimeout(recoveryRetryTimer)
       persistCooldown()
     },
     setUsageCache,
