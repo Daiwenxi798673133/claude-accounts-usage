@@ -1,6 +1,6 @@
 # claude-accounts-usage
 
-一个 OpenCode **TUI 插件**,用来查看多个 Claude(Pro/Max)账号的订阅用量,并在账号之间切换。
+一个 OpenCode **TUI 插件**,用来查看多个 Claude(Pro/Max)账号的订阅用量、在账号之间切换,并查看本地 OpenCode 的用量统计仪表盘(`/stats`)。
 
 它**不接管** `anthropic` auth provider,因此可以和 [`@ex-machina/opencode-anthropic-auth`](https://github.com/ex-machina-co/opencode-anthropic-auth) **共存** —— ex-machina 继续负责 OAuth 登录与请求注入,本插件只在工具层做"账号档案 + 切换 + 用量展示"。
 
@@ -9,8 +9,19 @@
 | 命令 | 作用 |
 |------|------|
 | `/usage` | 弹框显示所有账号的用量(5h / 7d / 7d-Sonnet 三个窗口,带进度条与重置倒计时),并可直接切号与删号:`↑↓` 选择、`enter` 切换(立即生效)、`d` 删除账号(再按一次 `d` 确认,当前账号不可删)、`esc` 关闭 |
+| `/stats` | 弹框显示本地 OpenCode 的用量统计仪表盘:总览 / 模型 / 提供方三个分页,含活跃热力图与 token 折线图,可切 All / 7天 / 30天 范围 |
 
 账号会在**插件加载时**以及每次 `/usage` 时**自动收录**当前 ex-machina 登录的账号,无需手动添加。
+
+## 用量统计仪表盘(`/stats`)
+
+直接读取本地 OpenCode 会话库(`opencode.db`)做统计,**只读、不联网**:
+
+- **三个分页**:`总览`(整体 token / 花费 / 会话 / 消息 / 活跃天数 + 连续天数,GitHub 风格活跃热力图)、`模型`、`提供方`(各自的 token 折线图与明细,`j/k` 选择条目)。
+- **时间范围**:`All` / `7天` / `30天`,打开时一次性扫描全表、之后切范围走内存聚合,切换即时无卡顿。
+- **快捷键**:`tab` / `←→` / `h l` 切页 · `r` 或 `1/2/3` 切范围 · `j/k` 选条目 · `q` / `esc` 关闭。
+
+> 数据来源是 OpenCode 自身记录的会话库,与 `/usage` 的"订阅额度"是两回事:`/usage` 看的是 Anthropic 订阅窗口剩余额度,`/stats` 看的是你本地累计的 token / 花费统计。
 
 ## 限流自动切号(自动重试)
 
@@ -41,13 +52,15 @@ TUI 插件只在 `~/.config/opencode/tui.json` 配置,**不要**放进 `opencode
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["claude-accounts-usage@0.1.5"]
+  "plugin": ["claude-accounts-usage@0.2.0-alpha1"]
 }
 ```
 
 OpenCode 会自动解析并安装该包,无需手动 `npm install`。
 
-> **建议带上版本号**(如 `@0.1.5`)。OpenCode 按"含版本号的包名"建独立缓存目录:写死版本号后,以后升级只需把后缀改成新版本号;若不带版本号,会被首次安装的版本锁住,发布新版也不会自动更新。
+> `0.2.0-alpha1` 是当前**预发布**版本(含 `/stats` 仪表盘与自动切号数据丢失修复)。`latest` 仍是旧的稳定版,因此**必须写明 `@0.2.0-alpha1`** 才能装到本版本。
+>
+> **建议带上版本号**。OpenCode 按"含版本号的包名"建独立缓存目录:写死版本号后,以后升级只需把后缀改成新版本号;若不带版本号,会被首次安装的版本锁住,发布新版也不会自动更新。
 
 ### 方式二:本地 clone(开发/离线)
 
