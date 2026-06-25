@@ -2,6 +2,7 @@ import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { loadAccounts, readActiveId, type AccountsFile, type StoredAccount } from "./accounts.ts"
 import { debugLog } from "./debug.ts"
 import { openRecoveryAlert } from "./dialogs.tsx"
+import { latestTurn } from "./turn.ts"
 import { collectAllUsage, switchToAccount, type AccountUsage, type UsageResponse } from "./usage.ts"
 
 const ENABLED = true
@@ -115,6 +116,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   const sessionLocks = new Map<string, Promise<unknown>>()
   const repromptInFlight = new Set<string>()
   const lastAction = new Map<string, number>()
+  const lastHandledAssistantId = new Map<string, string>()
   const seen = new Set<string>()
   let usageCache: { at: number; byId: Map<string, UsageResponse> } = { at: 0, byId: new Map() }
   let refreshing = false
@@ -342,41 +344,20 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     return out
   }
 
-  function findFailedAssistant(messages: ReturnType<TuiPluginApi["state"]["session"]["messages"]>): AssistantMsg | undefined {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i]
-      if (message.role === "assistant" && message.error) return message
-    }
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i]
-      if (message.role === "assistant") return message
-    }
-    return undefined
-  }
-
-  function findUserMessage(
-    messages: ReturnType<TuiPluginApi["state"]["session"]["messages"]>,
-    failed?: AssistantMsg,
-  ): StateMessage | undefined {
-    if (failed?.parentID) {
-      const parent = messages.find((message) => message.id === failed.parentID && message.role === "user")
-      if (parent) return parent
-    }
-    const failedIndex = failed ? messages.findIndex((message) => message.id === failed.id) : messages.length
-    const from = (failedIndex < 0 ? messages.length : failedIndex) - 1
-    for (let i = from; i >= 0; i--) {
-      if (messages[i].role === "user") return messages[i]
-    }
-    return undefined
-  }
-
-  async function waitIdle(sessionID: string): Promise<void> {
+  async function waitIdle(sessionID: string): Promise<boolean> {
     const deadline = Date.now() + IDLE_WAIT_TIMEOUT_MS
     while (Date.now() < deadline) {
       const status = api.state.session.status(sessionID)
-      if (!status || status.type === "idle") return
+      if (!status || status.type === "idle") return true
       await sleep(IDLE_POLL_MS)
     }
+    return false
+  }
+
+  function turnWroteFiles(assistantID: string): boolean {
+    return api.state
+      .part(assistantID)
+      .some((part) => part.type === "patch" || (part.type === "tool" && part.state?.status === "completed"))
   }
 
   async function repromptFailedTurn(sessionID: string, abortFirst: boolean): Promise<void> {
@@ -391,19 +372,31 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
           // ignore: stream may already be settling
         }
       }
-      await waitIdle(sessionID)
+      // session.revert physically rolls back files after the boundary; only act once settled.
+      if (!(await waitIdle(sessionID))) return guidance()
 
       const messages = api.state.session.messages(sessionID)
-      const failed = findFailedAssistant(messages)
-      const userMessage = findUserMessage(messages, failed)
-      if (!userMessage) return guidance()
+      const turn = latestTurn(messages)
+      if (!turn) return guidance()
+      const { user, failed } = turn
 
-      const parts = toInputParts(api.state.part(userMessage.id))
+      if (lastHandledAssistantId.get(sessionID) === failed.id) return
+
+      const parts = toInputParts(api.state.part(user.id))
       if (parts.length === 0) return guidance()
 
-      const reverted = await api.client.session.revert({ sessionID, messageID: userMessage.id })
-      if (reverted.error) return guidance()
+      // revert would discard files this turn already wrote and a redo can't reproduce them — refuse.
+      if (turnWroteFiles(failed.id)) {
+        api.ui.toast({ variant: "warning", message: "已切换账号；上一轮已改动文件，未自动回退，请手动重发以免覆盖改动" })
+        return
+      }
 
+      lastHandledAssistantId.set(sessionID, failed.id)
+      const reverted = await api.client.session.revert({ sessionID, messageID: user.id })
+      if (reverted.error) {
+        lastHandledAssistantId.delete(sessionID)
+        return guidance()
+      }
       const prompted = await api.client.session.promptAsync({ sessionID, parts })
       if (prompted.error) guidance()
     } catch {
