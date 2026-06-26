@@ -1,6 +1,7 @@
 import { readFile, writeFile, mkdir, rename } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join, dirname } from "node:path"
+import { log } from "./logger.ts"
 
 export type StoredAccount = {
   id: string
@@ -113,11 +114,13 @@ export async function writeAuthAnthropic(token: AuthToken): Promise<void> {
     expires: token.expires ?? 0,
   }
   await atomicWriteJson(path, auth)
+  log.info("accounts:write-auth", { hasAccess: Boolean(token.access), expires: token.expires ?? 0 })
 }
 
 export async function upsertAccount(id: string, label: string, token: AuthToken): Promise<AccountsFile> {
   const file = await loadAccounts()
   const index = file.accounts.findIndex((account) => account.id === id)
+  const inserted = index < 0
   if (index >= 0) {
     file.accounts[index] = {
       ...file.accounts[index],
@@ -130,14 +133,20 @@ export async function upsertAccount(id: string, label: string, token: AuthToken)
   }
   file.activeId = id
   await saveAccounts(file)
+  log.info("accounts:upsert", { id, label, inserted })
   return file
 }
 
 export async function setActiveId(id: string): Promise<void> {
   const file = await loadAccounts()
-  if (!file.accounts.some((account) => account.id === id)) return
+  if (!file.accounts.some((account) => account.id === id)) {
+    log.warn("accounts:set-active-unknown", { id })
+    return
+  }
+  const from = file.activeId
   file.activeId = id
   await saveAccounts(file)
+  log.info("accounts:set-active", { from, to: id })
 }
 
 // Removes an account from claude-accounts.json only. Deliberately does NOT touch
@@ -151,6 +160,7 @@ export async function removeAccount(id: string): Promise<StoredAccount | undefin
     const [removed] = file.accounts.splice(index, 1)
     if (file.activeId === id) file.activeId = undefined
     await saveAccounts(file)
+    log.info("accounts:remove", { id, label: removed.label })
     return removed
   })
 }

@@ -36,7 +36,19 @@
 - **耗尽**:当所有账号都在冷却时停止切换,并弹出最近恢复时间的倒计时提示。
 - **恢复提醒**:冷却账号到达预估恢复时间后,弹出**常驻提示框**(需按键确认才关闭)告知该账号额度应已恢复、可切回使用;多个账号同时恢复会合并为一条。该提示基于响应头的 reset 估计,不会二次请求校验。
 
-> 调试:设环境变量 `CLAUDE_AUTOSWITCH_DEBUG=1` 可把未命中谓词的 429 样本追加到 `~/.config/opencode/claude-autoswitch.log`,便于校准检测规则。
+## 日志与排查
+
+插件日志写入 OpenCode 内建日志文件 `~/.local/share/opencode/log/opencode.log`,每条都带 `claude-accounts-usage` 标记,方便单独筛出来。
+
+查看:
+
+```bash
+grep "claude-accounts-usage" ~/.local/share/opencode/log/opencode.log
+```
+
+想看更详细的 debug 级日志(比如限流检测的原始样本):启动 opencode 时加上 `OPENCODE_LOG_LEVEL=DEBUG`(或 `--log-level DEBUG`),并设环境变量 `CLAUDE_AUTOSWITCH_DEBUG=1`。两者配合才会输出 debug 级别的诊断信息。
+
+提 issue 时:把相关日志行 grep 出来,贴到 <https://github.com/Daiwenxi798673133/claude-accounts-usage/issues>,并附上复现步骤。日志已对 token 做脱敏处理,但仍建议你粘贴前自查一遍,确认没有夹带敏感信息。
 
 ## 前置条件
 

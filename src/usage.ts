@@ -1,7 +1,7 @@
 import type { AuthToken, StoredAccount } from "./accounts.ts"
 import { loadAccounts, readAuthAnthropic, saveAccounts, upsertAccount, withAuthLock, writeAuthAnthropic } from "./accounts.ts"
 import { CLIENT_ID, INACTIVE_REFRESH_THRESHOLD_MS, OAUTH_BETA, TOKEN_EXPIRY_BUFFER_MS, TOKEN_URL, USAGE_ENDPOINT } from "./constants.ts"
-import { debugLog } from "./debug.ts"
+import { log, redactBody, redactHeaders } from "./logger.ts"
 import { fetchProfile } from "./profile.ts"
 
 const REFRESH_DELAY_MS = 500
@@ -49,6 +49,8 @@ function isRefresh429Cooldown(refresh: string): boolean {
 }
 
 function doRefreshToken(refresh: string): Promise<{ access: string; refresh: string; expires: number }> {
+  // PRIVACY: never log the request body — it contains the refresh_token / grant_type.
+  log.debug("usage:refresh-start")
   return fetch(TOKEN_URL, {
     method: "POST",
     headers: {
@@ -64,13 +66,14 @@ function doRefreshToken(refresh: string): Promise<{ access: string; refresh: str
       res.headers.forEach((value, key) => {
         headers[key] = value
       })
-      debugLog("refresh-failed", { status: res.status, headers, body: body.slice(0, 800) }, true)
+      log.warn("usage:refresh-failed", { status: res.status, headerKeys: redactHeaders(headers), body: redactBody(body) })
       if (res.status === 429) {
         refresh429Cooldown.set(refresh, Date.now() + REFRESH_429_COOLDOWN_MS)
       }
       throw new Error(`token refresh failed (${res.status})`)
     }
     const json = (await res.json()) as { access_token: string; refresh_token: string; expires_in: number }
+    log.debug("usage:refresh-result", { status: res.status })
     return {
       access: json.access_token,
       refresh: json.refresh_token,
@@ -90,10 +93,14 @@ export function refreshToken(refresh: string): Promise<{ access: string; refresh
 }
 
 export async function fetchUsage(access: string): Promise<UsageResponse> {
+  log.debug("usage:fetch-start")
   const res = await fetch(USAGE_ENDPOINT, {
     headers: { Authorization: `Bearer ${access}`, "anthropic-beta": OAUTH_BETA },
   })
-  if (!res.ok) throw new Error(`usage request failed (${res.status})`)
+  if (!res.ok) {
+    log.warn("usage:fetch-fail", { status: res.status })
+    throw new Error(`usage request failed (${res.status})`)
+  }
   return (await res.json()) as UsageResponse
 }
 
@@ -119,9 +126,10 @@ export async function autoCapture(): Promise<void> {
 async function ensureFresh(account: StoredAccount, bufferMs?: number): Promise<{ access?: string; updated?: StoredAccount }> {
   if (!isStale(account, bufferMs)) return { access: account.access }
   if (isRefresh429Cooldown(account.refresh)) {
-    debugLog("refresh-skip-429-cooldown", { label: account.label }, true)
+    log.warn("usage:refresh-skip-429", { label: account.label })
     return { access: account.access }
   }
+  log.debug("usage:ensure-fresh", { label: account.label })
   const fresh = await refreshToken(account.refresh)
   return { access: fresh.access, updated: { ...account, ...fresh } }
 }
@@ -149,6 +157,7 @@ export async function collectAllUsage(): Promise<{ activeId?: string; results: A
       const usage = await fetchUsage(access)
       settled.push({ result: { ...base, usage }, updated })
     } catch (error) {
+      log.warn("usage:collect-account-fail", { label: account.label, error: errorMessage(error) })
       settled.push({ result: { ...base, error: errorMessage(error) } })
     }
     if (needsRefresh && file.accounts.indexOf(account) < file.accounts.length - 1) {
@@ -180,7 +189,7 @@ export async function switchToAccount(id: string): Promise<StoredAccount> {
     let account = file.accounts[index]
     if (isStale(account)) {
       if (isRefresh429Cooldown(account.refresh)) {
-        debugLog("switch-skip-429-cooldown", { label: account.label }, true)
+        log.warn("usage:switch-skip-429", { label: account.label })
       } else {
         const fresh = await refreshToken(account.refresh)
         account = { ...account, ...fresh }
@@ -191,6 +200,7 @@ export async function switchToAccount(id: string): Promise<StoredAccount> {
     file.activeId = id
     await saveAccounts(file)
     await writeAuthAnthropic({ refresh: account.refresh, access: account.access, expires: account.expires })
+    log.info("usage:switch-commit", { id, label: account.label })
     return account
   })
 }

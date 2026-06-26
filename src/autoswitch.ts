@@ -1,15 +1,16 @@
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { loadAccounts, readActiveId, type AccountsFile, type StoredAccount } from "./accounts.ts"
-import { debugLog } from "./debug.ts"
+import { log, redactHeaders, redactBody } from "./logger.ts"
 import { openRecoveryAlert } from "./dialogs.tsx"
 import { latestTurn } from "./turn.ts"
+import { classifyTurnParts, type PartLike } from "./continuation.ts"
 import { collectAllUsage, switchToAccount, type AccountUsage, type UsageResponse } from "./usage.ts"
 
 const ENABLED = true
 const DEFAULT_COOLDOWN_MS = 60 * 60_000
 const USAGE_CACHE_TTL_MS = 10 * 60_000
 const RECENT_SWITCH_GUARD_MS = 4_000
-const IDLE_WAIT_TIMEOUT_MS = 4_000
+const IDLE_WAIT_TIMEOUT_MS = 8_000
 const IDLE_POLL_MS = 150
 const COOLDOWN_KV_KEY = "claude-accounts-usage.autoswitch.cooldown"
 
@@ -121,6 +122,9 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   let usageCache: { at: number; byId: Map<string, UsageResponse> } = { at: 0, byId: new Map() }
   let refreshing = false
   let lastSwitch: { id?: string; sessionID?: string; at: number } = { at: 0 }
+  // One-shot smoke hook (read once; UNSET ⇒ never armed ⇒ zero overhead). When truthy, the next
+  // idle turn injects one synthetic usage-limit to exercise the real switch→revert→promptAsync path.
+  let forceLimitOnce = Boolean(process.env.CLAUDE_AUTOSWITCH_FORCE_LIMIT_ONCE)
 
   function persistCooldown(): void {
     const now = Date.now()
@@ -174,6 +178,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     cooldown.set(id, until)
     persistCooldown()
     scheduleRecovery(id, until)
+    log.info("autoswitch:cooldown-enter", { id, until })
   }
 
   function clearCooldown(id: string): void {
@@ -183,7 +188,10 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       recoveryTimers.delete(id)
     }
     pendingRecovered.delete(id)
-    if (cooldown.delete(id)) persistCooldown()
+    if (cooldown.delete(id)) {
+      persistCooldown()
+      log.info("autoswitch:cooldown-clear", { id })
+    }
   }
 
   function isCooled(id: string, now: number): boolean {
@@ -215,6 +223,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       setUsageCache(results)
     } catch {
       // best-effort cache warming; selection falls back to round-robin
+      log.debug("autoswitch:usage-refresh-fail")
     } finally {
       refreshing = false
     }
@@ -266,21 +275,29 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     const candidates = file.accounts.filter(
       (account) => account.id !== activeId && !tried.has(account.id) && !isCooled(account.id, now),
     )
-    if (candidates.length === 0) return undefined
+    if (candidates.length === 0) {
+      log.debug("autoswitch:pick", { candidates: 0, cacheFresh: false, picked: undefined })
+      return undefined
+    }
 
     const cacheFresh = usageCache.at > 0 && now - usageCache.at <= USAGE_CACHE_TTL_MS
+    let picked: StoredAccount | undefined = candidates[0]
     if (cacheFresh) {
-      return [...candidates].sort((a, b) => score(usageCache.byId.get(a.id)) - score(usageCache.byId.get(b.id)))[0]
+      picked = [...candidates].sort((a, b) => score(usageCache.byId.get(a.id)) - score(usageCache.byId.get(b.id)))[0]
+    } else {
+      const order = file.accounts.map((account) => account.id)
+      const start = activeId ? order.indexOf(activeId) : -1
+      for (let offset = 1; offset <= order.length; offset++) {
+        const id = order[(start + offset + order.length) % order.length]
+        const match = candidates.find((account) => account.id === id)
+        if (match) {
+          picked = match
+          break
+        }
+      }
     }
-
-    const order = file.accounts.map((account) => account.id)
-    const start = activeId ? order.indexOf(activeId) : -1
-    for (let offset = 1; offset <= order.length; offset++) {
-      const id = order[(start + offset + order.length) % order.length]
-      const match = candidates.find((account) => account.id === id)
-      if (match) return match
-    }
-    return candidates[0]
+    log.debug("autoswitch:pick", { candidates: candidates.length, cacheFresh, picked: picked?.id })
+    return picked
   }
 
   function standDown(file: AccountsFile): void {
@@ -292,7 +309,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     const message = soonest
       ? `所有账号都已达额度上限，约 ${fmtDuration(soonest - now)} 后恢复`
       : "所有账号都已达额度上限"
-    debugLog("standdown", { accounts: file.accounts.length, soonest })
+    log.warn("autoswitch:standdown", { accounts: file.accounts.length, soonest })
     api.ui.toast({ variant: "error", message })
   }
 
@@ -314,14 +331,15 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
         const account = await switchToAccount(next.id)
         tried.add(next.id)
         lastSwitch = { id: account.id, sessionID, at: Date.now() }
-        debugLog("switched", { from: labelOf(file, activeId), to: account.label })
+        log.info("autoswitch:switched", { from: labelOf(file, activeId), to: account.label })
         api.ui.toast({
           variant: "warning",
           message: `「${labelOf(file, activeId)}」额度已满，已切到「${account.label}」并自动重试`,
         })
         void refreshUsageInBackground()
         return true
-      } catch {
+      } catch (error) {
+        log.warn("autoswitch:switch-candidate-fail", { id: next.id, error: String(error) })
         tried.add(next.id)
         markCooldown(next.id, undefined)
       }
@@ -351,13 +369,18 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       if (!status || status.type === "idle") return true
       await sleep(IDLE_POLL_MS)
     }
+    log.debug("autoswitch:wait-idle-timeout", { sessionID })
     return false
   }
 
-  function turnWroteFiles(assistantID: string): boolean {
-    return api.state
-      .part(assistantID)
-      .some((part) => part.type === "patch" || (part.type === "tool" && part.state?.status === "completed"))
+  // "mutated" = the turn wrote files, so auto-revert is refused; "readonly" = revert+redo is safe.
+  function classifyTurn(assistantID: string): "readonly" | "mutated" {
+    const parts: PartLike[] = api.state.part(assistantID).map((part) => ({
+      type: part.type,
+      tool: part.type === "tool" ? part.tool : undefined,
+      state: part.type === "tool" ? { status: part.state?.status } : undefined,
+    }))
+    return classifyTurnParts(parts)
   }
 
   async function repromptFailedTurn(sessionID: string, abortFirst: boolean): Promise<void> {
@@ -386,7 +409,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       if (parts.length === 0) return guidance()
 
       // revert would discard files this turn already wrote and a redo can't reproduce them — refuse.
-      if (turnWroteFiles(failed.id)) {
+      if (classifyTurn(failed.id) === "mutated") {
         api.ui.toast({ variant: "warning", message: "已切换账号；上一轮已改动文件，未自动回退，请手动重发以免覆盖改动" })
         return
       }
@@ -397,7 +420,19 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
         lastHandledAssistantId.delete(sessionID)
         return guidance()
       }
-      const prompted = await api.client.session.promptAsync({ sessionID, parts })
+      // Replay the failed turn's model + agent so the redo runs under the same config;
+      // promptAsync has no `mode` param, so session mode cannot be carried over (known limit).
+      const replay: Parameters<TuiPluginApi["client"]["session"]["promptAsync"]>[0] = { sessionID, parts }
+      if (failed.role === "assistant") {
+        replay.model = { providerID: failed.providerID, modelID: failed.modelID }
+        if (failed.agent) replay.agent = failed.agent
+      }
+      log.debug("autoswitch:reprompt", {
+        sessionID,
+        model: failed.role === "assistant" ? failed.modelID : undefined,
+        agent: failed.role === "assistant" ? failed.agent : undefined,
+      })
+      const prompted = await api.client.session.promptAsync(replay)
       if (prompted.error) guidance()
     } catch {
       guidance()
@@ -426,29 +461,12 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     })
   }
 
-  async function onRetried(event: { id: string; properties: { sessionID: string; error: RetryErrorLike } }): Promise<void> {
-    const error = event.properties.error
-    debugLog("retried", {
-      sessionID: event.properties.sessionID,
-      statusCode: error?.statusCode,
-      message: error?.message,
-      headerKeys: Object.keys(error?.responseHeaders ?? {}),
-      body: (error?.responseBody ?? "").slice(0, 300),
-    })
-    if (!ENABLED || !dedup(event.id)) return
-    const matched = isUsageLimit(error)
-    const anthropic = isAnthropicSession(event.properties.sessionID)
-    debugLog("retried-decision", { matched, anthropic })
-    if (!matched || !anthropic) return
-    await handleLimit(event.properties.sessionID, error, "retry")
-  }
-
   async function onStatus(event: {
     id: string
     properties: { sessionID: string; status?: { type: string; message?: string; next?: number } }
   }): Promise<void> {
     const status = event.properties.status
-    debugLog("status", {
+    log.debug("autoswitch:status", {
       sessionID: event.properties.sessionID,
       type: status?.type,
       message: status?.type === "retry" ? status.message : undefined,
@@ -457,7 +475,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     const error: RetryErrorLike = { message: status.message }
     const matched = isUsageLimit(error)
     const anthropic = isAnthropicSession(event.properties.sessionID)
-    debugLog("status-decision", { matched, anthropic })
+    log.debug("autoswitch:status-decision", { matched, anthropic })
     if (!matched || !anthropic) return
     await handleLimit(event.properties.sessionID, error, "retry")
   }
@@ -465,16 +483,17 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   async function onError(event: { id: string; properties: { sessionID?: string; error?: unknown } }): Promise<void> {
     const sessionID = event.properties.sessionID
     const error = toErrorData(event.properties.error)
-    debugLog("error", {
+    log.debug("autoswitch:error", {
       sessionID,
-      raw: event.properties.error,
       statusCode: error?.statusCode,
       message: error?.message,
+      headerKeys: redactHeaders(error?.responseHeaders),
+      body: redactBody(error?.responseBody),
     })
     if (!ENABLED || !dedup(event.id) || !sessionID) return
     const matched = !!error && isUsageLimit(error)
     const anthropic = isAnthropicSession(sessionID)
-    debugLog("error-decision", { matched, anthropic })
+    log.debug("autoswitch:error-decision", { matched, anthropic })
     if (!matched || !anthropic) return
     await handleLimit(sessionID, error, "error")
   }
@@ -484,24 +503,29 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     if (assistant && !assistant.error) {
       const activeId = await readActiveId()
       if (activeId) clearCooldown(activeId)
+      // A successful turn resets the per-session switch state so a later limit can switch again;
+      // this relocates the reset the dead session.next.prompted handler used to do.
+      attempted.delete(sessionID)
+      lastAction.delete(sessionID)
+    }
+    if (forceLimitOnce) {
+      forceLimitOnce = false
+      log.info("autoswitch:force-limit-injected", { sessionID })
+      const error: RetryErrorLike = { statusCode: 429, message: "forced rate limit (test): rate limit reached" }
+      await handleLimit(sessionID, error, "error")
     }
   }
 
-  debugLog("installed", { enabled: ENABLED })
+  log.info("autoswitch:installed", { enabled: ENABLED })
 
+  // session.next.* is not delivered to the current OpenCode SDK; detection relies on
+  // session.status(retry) + session.error.
   const offs = [
     api.event.on("session.status", (event) => {
       void onStatus(event)
     }),
-    api.event.on("session.next.retried", (event) => {
-      void onRetried(event)
-    }),
     api.event.on("session.error", (event) => {
       void onError(event)
-    }),
-    api.event.on("session.next.prompted", (event) => {
-      attempted.delete(event.properties.sessionID)
-      lastAction.delete(event.properties.sessionID)
     }),
     api.event.on("session.idle", (event) => {
       void onIdle(event.properties.sessionID)

@@ -8,6 +8,7 @@ bun.lock
 
 # 本地编辑器 / Agent 配置，勿提交
 .opencode/
+.sisyphus/
 
 # 本地密钥文件（npm token 等），勿提交
 vars.txt
