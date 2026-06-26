@@ -3,13 +3,14 @@ import { loadAccounts, readActiveId, type AccountsFile, type StoredAccount } fro
 import { log, redactHeaders, redactBody } from "./logger.ts"
 import { openRecoveryAlert } from "./dialogs.tsx"
 import { latestTurn } from "./turn.ts"
+import { classifyTurnParts, type PartLike } from "./continuation.ts"
 import { collectAllUsage, switchToAccount, type AccountUsage, type UsageResponse } from "./usage.ts"
 
 const ENABLED = true
 const DEFAULT_COOLDOWN_MS = 60 * 60_000
 const USAGE_CACHE_TTL_MS = 10 * 60_000
 const RECENT_SWITCH_GUARD_MS = 4_000
-const IDLE_WAIT_TIMEOUT_MS = 4_000
+const IDLE_WAIT_TIMEOUT_MS = 8_000
 const IDLE_POLL_MS = 150
 const COOLDOWN_KV_KEY = "claude-accounts-usage.autoswitch.cooldown"
 
@@ -365,13 +366,18 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       if (!status || status.type === "idle") return true
       await sleep(IDLE_POLL_MS)
     }
+    log.debug("autoswitch:wait-idle-timeout", { sessionID })
     return false
   }
 
-  function turnWroteFiles(assistantID: string): boolean {
-    return api.state
-      .part(assistantID)
-      .some((part) => part.type === "patch" || (part.type === "tool" && part.state?.status === "completed"))
+  // "mutated" = the turn wrote files, so auto-revert is refused; "readonly" = revert+redo is safe.
+  function classifyTurn(assistantID: string): "readonly" | "mutated" {
+    const parts: PartLike[] = api.state.part(assistantID).map((part) => ({
+      type: part.type,
+      tool: part.type === "tool" ? part.tool : undefined,
+      state: part.type === "tool" ? { status: part.state?.status } : undefined,
+    }))
+    return classifyTurnParts(parts)
   }
 
   async function repromptFailedTurn(sessionID: string, abortFirst: boolean): Promise<void> {
@@ -400,7 +406,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       if (parts.length === 0) return guidance()
 
       // revert would discard files this turn already wrote and a redo can't reproduce them — refuse.
-      if (turnWroteFiles(failed.id)) {
+      if (classifyTurn(failed.id) === "mutated") {
         api.ui.toast({ variant: "warning", message: "已切换账号；上一轮已改动文件，未自动回退，请手动重发以免覆盖改动" })
         return
       }
@@ -411,7 +417,19 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
         lastHandledAssistantId.delete(sessionID)
         return guidance()
       }
-      const prompted = await api.client.session.promptAsync({ sessionID, parts })
+      // Replay the failed turn's model + agent so the redo runs under the same config;
+      // promptAsync has no `mode` param, so session mode cannot be carried over (known limit).
+      const replay: Parameters<TuiPluginApi["client"]["session"]["promptAsync"]>[0] = { sessionID, parts }
+      if (failed.role === "assistant") {
+        replay.model = { providerID: failed.providerID, modelID: failed.modelID }
+        if (failed.agent) replay.agent = failed.agent
+      }
+      log.debug("autoswitch:reprompt", {
+        sessionID,
+        model: failed.role === "assistant" ? failed.modelID : undefined,
+        agent: failed.role === "assistant" ? failed.agent : undefined,
+      })
+      const prompted = await api.client.session.promptAsync(replay)
       if (prompted.error) guidance()
     } catch {
       guidance()
@@ -438,23 +456,6 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       lastAction.set(sessionID, Date.now())
       await repromptFailedTurn(sessionID, mode === "retry")
     })
-  }
-
-  async function onRetried(event: { id: string; properties: { sessionID: string; error: RetryErrorLike } }): Promise<void> {
-    const error = event.properties.error
-    log.debug("autoswitch:retried", {
-      sessionID: event.properties.sessionID,
-      statusCode: error?.statusCode,
-      message: error?.message,
-      headerKeys: redactHeaders(error?.responseHeaders),
-      body: redactBody(error?.responseBody),
-    })
-    if (!ENABLED || !dedup(event.id)) return
-    const matched = isUsageLimit(error)
-    const anthropic = isAnthropicSession(event.properties.sessionID)
-    log.debug("autoswitch:retried-decision", { matched, anthropic })
-    if (!matched || !anthropic) return
-    await handleLimit(event.properties.sessionID, error, "retry")
   }
 
   async function onStatus(event: {
@@ -499,24 +500,23 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     if (assistant && !assistant.error) {
       const activeId = await readActiveId()
       if (activeId) clearCooldown(activeId)
+      // A successful turn resets the per-session switch state so a later limit can switch again;
+      // this relocates the reset the dead session.next.prompted handler used to do.
+      attempted.delete(sessionID)
+      lastAction.delete(sessionID)
     }
   }
 
   log.info("autoswitch:installed", { enabled: ENABLED })
 
+  // session.next.* is not delivered to the current OpenCode SDK; detection relies on
+  // session.status(retry) + session.error.
   const offs = [
     api.event.on("session.status", (event) => {
       void onStatus(event)
     }),
-    api.event.on("session.next.retried", (event) => {
-      void onRetried(event)
-    }),
     api.event.on("session.error", (event) => {
       void onError(event)
-    }),
-    api.event.on("session.next.prompted", (event) => {
-      attempted.delete(event.properties.sessionID)
-      lastAction.delete(event.properties.sessionID)
     }),
     api.event.on("session.idle", (event) => {
       void onIdle(event.properties.sessionID)
