@@ -122,6 +122,9 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   let usageCache: { at: number; byId: Map<string, UsageResponse> } = { at: 0, byId: new Map() }
   let refreshing = false
   let lastSwitch: { id?: string; sessionID?: string; at: number } = { at: 0 }
+  // One-shot smoke hook (read once; UNSET ⇒ never armed ⇒ zero overhead). When truthy, the next
+  // idle turn injects one synthetic usage-limit to exercise the real switch→revert→promptAsync path.
+  let forceLimitOnce = Boolean(process.env.CLAUDE_AUTOSWITCH_FORCE_LIMIT_ONCE)
 
   function persistCooldown(): void {
     const now = Date.now()
@@ -504,6 +507,12 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       // this relocates the reset the dead session.next.prompted handler used to do.
       attempted.delete(sessionID)
       lastAction.delete(sessionID)
+    }
+    if (forceLimitOnce) {
+      forceLimitOnce = false
+      log.info("autoswitch:force-limit-injected", { sessionID })
+      const error: RetryErrorLike = { statusCode: 429, message: "forced rate limit (test): rate limit reached" }
+      await handleLimit(sessionID, error, "error")
     }
   }
 
