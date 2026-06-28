@@ -3,7 +3,7 @@ import { loadAccounts, readActiveId, type AccountsFile, type StoredAccount } fro
 import { log, redactHeaders, redactBody } from "./logger.ts"
 import { openRecoveryAlert } from "./dialogs.tsx"
 import { latestTurn } from "./turn.ts"
-import { classifyTurnParts, type PartLike } from "./continuation.ts"
+import { decideRedo, type PartLike } from "./continuation.ts"
 import { collectAllUsage, switchToAccount, type AccountUsage, type UsageResponse } from "./usage.ts"
 
 const ENABLED = true
@@ -123,7 +123,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   let refreshing = false
   let lastSwitch: { id?: string; sessionID?: string; at: number } = { at: 0 }
   // One-shot smoke hook (read once; UNSET ⇒ never armed ⇒ zero overhead). When truthy, the next
-  // idle turn injects one synthetic usage-limit to exercise the real switch→revert→promptAsync path.
+  // idle turn injects one synthetic usage-limit to exercise the real switch→continue/resend path.
   let forceLimitOnce = Boolean(process.env.CLAUDE_AUTOSWITCH_FORCE_LIMIT_ONCE)
 
   function persistCooldown(): void {
@@ -373,16 +373,6 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     return false
   }
 
-  // "mutated" = the turn wrote files, so auto-revert is refused; "readonly" = revert+redo is safe.
-  function classifyTurn(assistantID: string): "readonly" | "mutated" {
-    const parts: PartLike[] = api.state.part(assistantID).map((part) => ({
-      type: part.type,
-      tool: part.type === "tool" ? part.tool : undefined,
-      state: part.type === "tool" ? { status: part.state?.status } : undefined,
-    }))
-    return classifyTurnParts(parts)
-  }
-
   async function repromptFailedTurn(sessionID: string, abortFirst: boolean): Promise<void> {
     if (repromptInFlight.has(sessionID)) return
     repromptInFlight.add(sessionID)
@@ -395,7 +385,6 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
           // ignore: stream may already be settling
         }
       }
-      // session.revert physically rolls back files after the boundary; only act once settled.
       if (!(await waitIdle(sessionID))) return guidance()
 
       const messages = api.state.session.messages(sessionID)
@@ -405,35 +394,36 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
 
       if (lastHandledAssistantId.get(sessionID) === failed.id) return
 
-      const parts = toInputParts(api.state.part(user.id))
-      if (parts.length === 0) return guidance()
+      const failedParts: PartLike[] = api.state.part(failed.id).map((part) => ({
+        type: part.type,
+        tool: part.type === "tool" ? part.tool : undefined,
+        text: part.type === "text" ? part.text : undefined,
+        state: part.type === "tool" ? { status: part.state?.status } : undefined,
+      }))
 
-      // revert would discard files this turn already wrote and a redo can't reproduce them — refuse.
-      if (classifyTurn(failed.id) === "mutated") {
-        api.ui.toast({ variant: "warning", message: "已切换账号；上一轮已改动文件，未自动回退，请手动重发以免覆盖改动" })
-        return
+      let parts: PromptParts
+      if (decideRedo(failedParts) === "continue") {
+        parts = [{ type: "text", text: "continue" }]
+        log.debug("autoswitch:continue", { sessionID })
+      } else {
+        parts = toInputParts(api.state.part(user.id))
+        if (parts.length === 0) return guidance()
+        log.debug("autoswitch:resend", { sessionID })
       }
 
       lastHandledAssistantId.set(sessionID, failed.id)
-      const reverted = await api.client.session.revert({ sessionID, messageID: user.id })
-      if (reverted.error) {
-        lastHandledAssistantId.delete(sessionID)
-        return guidance()
-      }
       // Replay the failed turn's model + agent so the redo runs under the same config;
       // promptAsync has no `mode` param, so session mode cannot be carried over (known limit).
-      const replay: Parameters<TuiPluginApi["client"]["session"]["promptAsync"]>[0] = { sessionID, parts }
+      const arg: Parameters<TuiPluginApi["client"]["session"]["promptAsync"]>[0] = { sessionID, parts }
       if (failed.role === "assistant") {
-        replay.model = { providerID: failed.providerID, modelID: failed.modelID }
-        if (failed.agent) replay.agent = failed.agent
+        arg.model = { providerID: failed.providerID, modelID: failed.modelID }
+        if (failed.agent) arg.agent = failed.agent
       }
-      log.debug("autoswitch:reprompt", {
-        sessionID,
-        model: failed.role === "assistant" ? failed.modelID : undefined,
-        agent: failed.role === "assistant" ? failed.agent : undefined,
-      })
-      const prompted = await api.client.session.promptAsync(replay)
-      if (prompted.error) guidance()
+      const prompted = await api.client.session.promptAsync(arg)
+      if (prompted.error) {
+        lastHandledAssistantId.delete(sessionID)
+        guidance()
+      }
     } catch {
       guidance()
     } finally {

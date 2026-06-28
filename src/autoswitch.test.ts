@@ -96,24 +96,42 @@ const fireRetry = (handlers: Map<string, Handler>, id: string) =>
 const fireIdle = (handlers: Map<string, Handler>, id: string) =>
   handlers.get("session.idle")?.({ id, properties: { sessionID: "s1" } })
 
-test("无缝续接:只读回合 → revert + promptAsync,不弹手动重发提示", async () => {
+test("无缝续接:有产出回合 → promptAsync(continue),从不 revert,不弹手动重发提示", async () => {
   const { handlers, toasts, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
-  fireRetry(handlers, "evt-readonly")
+  fireRetry(handlers, "evt-output")
   await flush(() => calls.promptAsync.length > 0)
 
-  expect(calls.revert.length).toBe(1)
+  expect(calls.revert.length).toBe(0)
   expect(calls.promptAsync.length).toBe(1)
+  const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
   expect(toasts.some((t) => t.message.includes("请手动重新发送") || t.message.includes("请手动重发"))).toBe(false)
   controller.dispose()
 })
 
-test("拒绝回退:改动回合(patch) → 不 revert,弹警告提示", async () => {
+test("无缝续接:已改文件回合(patch) → 同样 promptAsync(continue),从不 revert,无拒绝提示", async () => {
   const { handlers, toasts, calls, controller } = setup([{ type: "patch" }])
-  fireRetry(handlers, "evt-mutated")
-  await flush(() => toasts.some((t) => t.message.includes("未自动回退")))
+  fireRetry(handlers, "evt-patch")
+  await flush(() => calls.promptAsync.length > 0)
 
   expect(calls.revert.length).toBe(0)
-  expect(toasts.some((t) => t.variant === "warning" && t.message.includes("未自动回退"))).toBe(true)
+  expect(calls.promptAsync.length).toBe(1)
+  const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
+  expect(toasts.some((t) => t.message.includes("请手动重发") || t.message.includes("未自动回退"))).toBe(false)
+  controller.dispose()
+})
+
+test("无产出回合(失败 assistant 无 parts) → promptAsync 收到原始 prompt parts(resend),从不 revert", async () => {
+  const { handlers, calls, controller } = setup([])
+  fireRetry(handlers, "evt-noout")
+  await flush(() => calls.promptAsync.length > 0)
+
+  expect(calls.revert.length).toBe(0)
+  expect(calls.promptAsync.length).toBe(1)
+  const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "hello")).toBe(true)
+  expect(arg.parts.some((p) => p.text === "continue")).toBe(false)
   controller.dispose()
 })
 
@@ -130,7 +148,7 @@ test("force-limit 钩子:env 未设 → 正常回合 idle 不触发任何切号/
   controller.dispose()
 })
 
-test("force-limit 钩子:env 设 → idle 一次性注入 → revert+promptAsync,二次 idle 不再触发", async () => {
+test("force-limit 钩子:env 设 → idle 一次性注入 → continue/resend(从不 revert),二次 idle 不再触发", async () => {
   process.env.CLAUDE_AUTOSWITCH_FORCE_LIMIT_ONCE = "1"
   switchCalls.length = 0
   try {
@@ -139,8 +157,10 @@ test("force-limit 钩子:env 设 → idle 一次性注入 → revert+promptAsync
     await flush(() => calls.promptAsync.length > 0)
 
     expect(switchCalls).toEqual(["acc2"])
-    expect(calls.revert.length).toBe(1)
+    expect(calls.revert.length).toBe(0)
     expect(calls.promptAsync.length).toBe(1)
+    const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+    expect(arg.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
     expect(toasts.some((t) => t.message.includes("请手动重新发送") || t.message.includes("请手动重发"))).toBe(false)
 
     const promptedOnce = calls.promptAsync.length
