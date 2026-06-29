@@ -113,7 +113,6 @@ const tui: TuiPlugin = async (api) => {
             try {
               await setAccountExcluded(id, next)
               api.ui.toast({ variant: "success", message: next ? "已标记,不参与自动切号" : "已取消标记" })
-              void refreshUsage()
             } catch (error) {
               api.ui.toast({ variant: "error", message: `标记失败: ${message(error)}` })
             }
