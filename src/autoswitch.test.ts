@@ -172,3 +172,70 @@ test("force-limit 钩子:env 设 → idle 一次性注入 → continue/resend(�
     delete process.env.CLAUDE_AUTOSWITCH_FORCE_LIMIT_ONCE
   }
 })
+
+function setupMultiStep(lastAssistantParts: unknown[]) {
+  const handlers = new Map<string, Handler>()
+  const toasts: Toast[] = []
+  const calls = { abort: 0, revert: [] as unknown[], promptAsync: [] as unknown[] }
+  const messages = [
+    { id: "u1", role: "user", parentID: undefined },
+    { id: "a1", role: "assistant", parentID: "u1", providerID: "anthropic", modelID: "claude-x", agent: "build", error: undefined },
+    { id: "a2", role: "assistant", parentID: "u1", providerID: "anthropic", modelID: "claude-x", agent: "build", error: undefined },
+  ]
+  const parts: Record<string, unknown[]> = {
+    u1: [{ type: "text", text: "hello", synthetic: false, ignored: false }],
+    a1: [{ type: "tool", tool: "read", state: { status: "completed" } }],
+    a2: lastAssistantParts,
+  }
+
+  const api = {
+    event: {
+      on: (name: string, cb: Handler) => {
+        handlers.set(name, cb)
+        return () => handlers.delete(name)
+      },
+    },
+    ui: { toast: (t: Toast) => toasts.push(t), dialog: { open: false } },
+    client: {
+      app: { log: () => Promise.resolve() },
+      session: {
+        abort: async () => {
+          calls.abort++
+          return {}
+        },
+        revert: async (a: unknown) => {
+          calls.revert.push(a)
+          return { error: undefined }
+        },
+        promptAsync: async (a: unknown) => {
+          calls.promptAsync.push(a)
+          return { error: undefined }
+        },
+      },
+    },
+    state: {
+      session: {
+        messages: () => messages,
+        status: () => ({ type: "idle" }),
+      },
+      part: (id: string) => parts[id] ?? [],
+    },
+    kv: { get: () => ({}), set: () => {} },
+  } as unknown as TuiPluginApi
+
+  const controller = installAutoSwitch(api)
+  return { handlers, toasts, calls, controller }
+}
+
+test("多步回合(一 user 多 assistant)撞限 → 命中最后一条 assistant → promptAsync(continue),从不 revert,无手动重发提示", async () => {
+  const { handlers, toasts, calls, controller } = setupMultiStep([{ type: "tool", tool: "edit", state: { status: "completed" } }])
+  fireRetry(handlers, "evt-multistep")
+  await flush(() => calls.promptAsync.length > 0)
+
+  expect(calls.promptAsync.length).toBe(1)
+  const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
+  expect(calls.revert.length).toBe(0)
+  expect(toasts.some((t) => t.message.includes("请手动重新发送") || t.message.includes("请手动重发"))).toBe(false)
+  controller.dispose()
+})
