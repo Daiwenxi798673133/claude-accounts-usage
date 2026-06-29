@@ -1,6 +1,6 @@
 {
   "name": "claude-accounts-usage",
-  "version": "0.2.0",
+  "version": "0.2.0-alpha2",
   "description": "OpenCode TUI plugin to view multi-account Claude usage and switch the active account. Coexists with @ex-machina/opencode-anthropic-auth.",
   "type": "module",
   "license": "MIT",
