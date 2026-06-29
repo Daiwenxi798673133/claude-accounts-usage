@@ -86,6 +86,9 @@ function AccountRow(props: {
           {isActive() ? "●" : "○"} {props.account.label}
           {isActive() ? " (当前)" : ""}
         </text>
+        <Show when={props.account.excluded}>
+          <text fg={theme().textMuted}>不自动切</text>
+        </Show>
         <Show when={props.pendingDelete}>
           <text fg={theme().error}>确认删除? 再按 d · 其他键取消</text>
         </Show>
@@ -118,6 +121,7 @@ function AccountsPanel(props: {
   state: () => UsageState
   onSwitch: (id: string) => void
   onDelete: (id: string) => void
+  onToggleExclude: (id: string, next: boolean) => void
 }) {
   const api = props.api
   const theme = () => api.theme.current
@@ -195,6 +199,17 @@ function AccountsPanel(props: {
       move(1)
       return
     }
+    if (evt.name === "m") {
+      evt.preventDefault()
+      evt.stopPropagation()
+      setPendingDelete(false)
+      const account = accounts()[index()]
+      if (!account) return
+      const next = !account.excluded
+      props.onToggleExclude(account.id, next)
+      setAccounts((list) => list.map((item) => (item.id === account.id ? { ...item, excluded: next } : item)))
+      return
+    }
     setPendingDelete(false)
   })
 
@@ -204,7 +219,7 @@ function AccountsPanel(props: {
         <text fg={theme().text}>
           <b>Claude 账号用量</b>
         </text>
-        <text fg={theme().textMuted}>↑↓ 选择 · enter 切换 · d 删除 · esc 关闭</text>
+        <text fg={theme().textMuted}>↑↓ 选择 · enter 切换 · m 标记不自动切 · d 删除 · esc 关闭</text>
       </box>
       <For each={accounts()}>
         {(account, i) => (
@@ -247,6 +262,7 @@ export function openUsageDialog(
   state: () => UsageState,
   onSwitch: (id: string) => void | Promise<void>,
   onDelete: (id: string) => void | Promise<void>,
+  onToggleExclude: (id: string, next: boolean) => void | Promise<void>,
 ): void {
   api.ui.dialog.setSize("medium")
   api.ui.dialog.replace(() => (
@@ -257,6 +273,7 @@ export function openUsageDialog(
       state={state}
       onSwitch={(id) => void onSwitch(id)}
       onDelete={(id) => void onDelete(id)}
+      onToggleExclude={(id, next) => void onToggleExclude(id, next)}
     />
   ))
 }
