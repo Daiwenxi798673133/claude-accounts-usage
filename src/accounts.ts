@@ -9,6 +9,7 @@ export type StoredAccount = {
   refresh: string
   access?: string
   expires?: number
+  excluded?: boolean
 }
 
 export type AccountsFile = {
@@ -162,5 +163,21 @@ export async function removeAccount(id: string): Promise<StoredAccount | undefin
     await saveAccounts(file)
     log.info("accounts:remove", { id, label: removed.label })
     return removed
+  })
+}
+
+export async function setAccountExcluded(id: string, excluded: boolean): Promise<StoredAccount | undefined> {
+  return withAuthLock(async () => {
+    const file = await loadAccounts()
+    const account = file.accounts.find((item) => item.id === id)
+    if (!account) {
+      log.warn("accounts:set-excluded-unknown", { id })
+      return undefined
+    }
+    if (excluded) account.excluded = true
+    else delete account.excluded
+    await saveAccounts(file)
+    log.info("accounts:set-excluded", { id, excluded })
+    return account
   })
 }

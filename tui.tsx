@@ -1,6 +1,6 @@
 import { createSignal } from "solid-js"
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { loadAccounts, removeAccount } from "./src/accounts.ts"
+import { loadAccounts, removeAccount, setAccountExcluded } from "./src/accounts.ts"
 import { autoCapture, collectAllUsage, switchToAccount } from "./src/usage.ts"
 import { installAutoSwitch } from "./src/autoswitch.ts"
 import { initLogger, log } from "./src/logger.ts"
@@ -107,6 +107,14 @@ const tui: TuiPlugin = async (api) => {
             } catch (error) {
               log.warn("tui:remove-fail", { id, error: message(error) })
               api.ui.toast({ variant: "error", message: `删除失败: ${message(error)}` })
+            }
+          },
+          async (id, next) => {
+            try {
+              await setAccountExcluded(id, next)
+              api.ui.toast({ variant: "success", message: next ? "已标记,不参与自动切号" : "已取消标记" })
+            } catch (error) {
+              api.ui.toast({ variant: "error", message: `标记失败: ${message(error)}` })
             }
           },
         )
