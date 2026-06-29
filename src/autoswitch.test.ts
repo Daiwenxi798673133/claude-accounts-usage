@@ -1,21 +1,25 @@
 import { expect, test, mock } from "bun:test"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 
+type AccountsState = { accounts: Array<Record<string, unknown>>; activeId?: string }
+const defaultAccounts = (): AccountsState => ({
+  accounts: [
+    { id: "acc1", label: "A" },
+    { id: "acc2", label: "B" },
+  ],
+  activeId: "acc1",
+})
+let accountsOverride: AccountsState | undefined
 mock.module("./accounts.ts", () => ({
-  loadAccounts: async () => ({
-    accounts: [
-      { id: "acc1", label: "A" },
-      { id: "acc2", label: "B" },
-    ],
-    activeId: "acc1",
-  }),
-  readActiveId: async () => "acc1",
+  loadAccounts: async () => accountsOverride ?? defaultAccounts(),
+  readActiveId: async () => (accountsOverride ?? defaultAccounts()).activeId,
 }))
 const switchCalls: string[] = []
+const accountLabel = (id: string) => (id === "acc2" ? "B" : id === "acc3" ? "C" : "A")
 mock.module("./usage.ts", () => ({
   switchToAccount: async (id: string) => {
     switchCalls.push(id)
-    return { id, label: id === "acc2" ? "B" : "A" }
+    return { id, label: accountLabel(id) }
   },
   collectAllUsage: async () => ({ results: [] }),
 }))
@@ -238,4 +242,50 @@ test("多步回合(一 user 多 assistant)撞限 → 命中最后一条 assistan
   expect(calls.revert.length).toBe(0)
   expect(toasts.some((t) => t.message.includes("请手动重新发送") || t.message.includes("请手动重发"))).toBe(false)
   controller.dispose()
+})
+
+test("标记号不参与自动切号:撞限切到未标记号(acc3),跳过 excluded 的 acc2", async () => {
+  switchCalls.length = 0
+  accountsOverride = {
+    accounts: [
+      { id: "acc1", label: "A" },
+      { id: "acc2", label: "B", excluded: true },
+      { id: "acc3", label: "C" },
+    ],
+    activeId: "acc1",
+  }
+  try {
+    const { handlers, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    fireRetry(handlers, "evt-skip-excluded")
+    await flush(() => switchCalls.length > 0)
+
+    expect(switchCalls).toContain("acc3")
+    expect(switchCalls).not.toContain("acc2")
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("仅剩标记号:撞限 → standDown(不切到标记号、零 promptAsync、出现额度上限 toast)", async () => {
+  switchCalls.length = 0
+  accountsOverride = {
+    accounts: [
+      { id: "acc1", label: "A" },
+      { id: "acc2", label: "B", excluded: true },
+    ],
+    activeId: "acc1",
+  }
+  try {
+    const { handlers, toasts, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    fireRetry(handlers, "evt-all-excluded")
+    await flush(() => toasts.some((t) => t.variant === "error"))
+
+    expect(switchCalls.length).toBe(0)
+    expect(calls.promptAsync.length).toBe(0)
+    expect(toasts.some((t) => t.variant === "error" && t.message.includes("额度上限"))).toBe(true)
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
 })
