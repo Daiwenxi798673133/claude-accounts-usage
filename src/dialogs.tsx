@@ -255,6 +255,24 @@ export function openRecoveryAlert(api: TuiPluginApi, labels: string[]): void {
   api.ui.dialog.replace(() => <Alert title="额度恢复" message={message} onConfirm={() => api.ui.dialog.clear()} />)
 }
 
+function recoverIn(ms: number): string {
+  const minutes = Math.max(1, Math.round(ms / 60_000))
+  if (minutes < 60) return `${minutes} 分钟`
+  const hours = Math.floor(minutes / 60)
+  const rest = minutes % 60
+  return rest > 0 ? `${hours} 小时 ${rest} 分钟` : `${hours} 小时`
+}
+
+export function openExhaustedAlert(api: TuiPluginApi, soonestMs?: number): void {
+  const message =
+    soonestMs === undefined
+      ? "所有账号都已达额度上限"
+      : `所有账号都已达额度上限，约 ${recoverIn(soonestMs)} 后恢复，届时将自动续接`
+  const Alert = api.ui.DialogAlert
+  api.ui.dialog.setSize("medium")
+  api.ui.dialog.replace(() => <Alert title="额度已满" message={message} onConfirm={() => api.ui.dialog.clear()} />)
+}
+
 export function openUsageDialog(
   api: TuiPluginApi,
   accounts: StoredAccount[],
