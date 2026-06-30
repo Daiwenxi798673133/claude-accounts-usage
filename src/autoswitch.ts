@@ -390,16 +390,21 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       const messages = api.state.session.messages(sessionID)
       const turn = latestTurn(messages)
       if (!turn) return guidance()
-      const { user, failed } = turn
+      const { user, failed, assistants } = turn
 
       if (lastHandledAssistantId.get(sessionID) === failed.id) return
 
-      const failedParts: PartLike[] = api.state.part(failed.id).map((part) => ({
-        type: part.type,
-        tool: part.type === "tool" ? part.tool : undefined,
-        text: part.type === "text" ? part.text : undefined,
-        state: part.type === "tool" ? { status: part.state?.status } : undefined,
-      }))
+      // Fold parts across all assistant steps, not just the last: a rate-limit hit at a step
+      // boundary leaves an empty placeholder tail, so judging `failed.id` alone resends instead
+      // of continuing the productive earlier steps.
+      const failedParts: PartLike[] = assistants.flatMap((m) =>
+        api.state.part(m.id).map((part) => ({
+          type: part.type,
+          tool: part.type === "tool" ? part.tool : undefined,
+          text: part.type === "text" ? part.text : undefined,
+          state: part.type === "tool" ? { status: part.state?.status } : undefined,
+        })),
+      )
 
       let parts: PromptParts
       if (decideRedo(failedParts) === "continue") {
