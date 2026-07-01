@@ -1,7 +1,7 @@
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { loadAccounts, readActiveId, type AccountsFile, type StoredAccount } from "./accounts.ts"
 import { log, redactHeaders, redactBody } from "./logger.ts"
-import { openRecoveryAlert } from "./dialogs.tsx"
+import { openRecoveryAlert, openExhaustedAlert } from "./dialogs.tsx"
 import { latestTurn } from "./turn.ts"
 import { decideRedo, type PartLike } from "./continuation.ts"
 import { collectAllUsage, switchToAccount, type AccountUsage, type UsageResponse } from "./usage.ts"
@@ -116,6 +116,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   const attempted = new Map<string, Set<string>>()
   const sessionLocks = new Map<string, Promise<unknown>>()
   const repromptInFlight = new Set<string>()
+  const stalledSessions = new Set<string>()
   const lastAction = new Map<string, number>()
   const lastHandledAssistantId = new Map<string, string>()
   const seen = new Set<string>()
@@ -152,6 +153,30 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     cooldown.delete(id)
     persistCooldown()
     if (!account) return
+    // A recovered account with stalled sessions: switch back to it and auto-resume each
+    // stalled turn via continue (riding Fix A's whole-turn aggregation). Excluded accounts
+    // are never auto-switched into — fall through to a plain recovery notice instead.
+    if (stalledSessions.size > 0 && !account.excluded) {
+      try {
+        await switchToAccount(id)
+        log.info("autoswitch:recover-resume", { id, sessions: stalledSessions.size })
+        api.ui.toast({
+          variant: "warning",
+          message: `「${account.label}」额度已恢复，正在自动续接 ${stalledSessions.size} 个会话`,
+        })
+        void refreshUsageInBackground()
+        for (const sid of [...stalledSessions]) {
+          stalledSessions.delete(sid)
+          attempted.delete(sid)
+          lastAction.delete(sid)
+          await repromptFailedTurn(sid, false)
+        }
+        return
+      } catch (error) {
+        log.warn("autoswitch:recover-resume-fail", { id, error: String(error) })
+        // fall through to announce
+      }
+    }
     pendingRecovered.set(id, account.label)
     flushRecovered()
   }
@@ -311,6 +336,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       : "所有账号都已达额度上限"
     log.warn("autoswitch:standdown", { accounts: file.accounts.length, soonest })
     api.ui.toast({ variant: "error", message })
+    openExhaustedAlert(api, soonest ? soonest - now : undefined)
   }
 
   async function doSwitch(sessionID: string, error: RetryErrorLike, activeId?: string): Promise<boolean> {
@@ -390,16 +416,21 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       const messages = api.state.session.messages(sessionID)
       const turn = latestTurn(messages)
       if (!turn) return guidance()
-      const { user, failed } = turn
+      const { user, failed, assistants } = turn
 
       if (lastHandledAssistantId.get(sessionID) === failed.id) return
 
-      const failedParts: PartLike[] = api.state.part(failed.id).map((part) => ({
-        type: part.type,
-        tool: part.type === "tool" ? part.tool : undefined,
-        text: part.type === "text" ? part.text : undefined,
-        state: part.type === "tool" ? { status: part.state?.status } : undefined,
-      }))
+      // Fold parts across all assistant steps, not just the last: a rate-limit hit at a step
+      // boundary leaves an empty placeholder tail, so judging `failed.id` alone resends instead
+      // of continuing the productive earlier steps.
+      const failedParts: PartLike[] = assistants.flatMap((m) =>
+        api.state.part(m.id).map((part) => ({
+          type: part.type,
+          tool: part.type === "tool" ? part.tool : undefined,
+          text: part.type === "text" ? part.text : undefined,
+          state: part.type === "tool" ? { status: part.state?.status } : undefined,
+        })),
+      )
 
       let parts: PromptParts
       if (decideRedo(failedParts) === "continue") {
@@ -444,7 +475,10 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       const reuseFresh =
         !!activeId && lastSwitch.id === activeId && lastSwitch.sessionID !== sessionID && now - lastSwitch.at < RECENT_SWITCH_GUARD_MS
       const usable = reuseFresh ? true : await doSwitch(sessionID, error, activeId)
-      if (!usable) return
+      if (!usable) {
+        stalledSessions.add(sessionID)
+        return
+      }
 
       lastAction.set(sessionID, Date.now())
       await repromptFailedTurn(sessionID, mode === "retry")
@@ -497,6 +531,8 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       // this relocates the reset the dead session.next.prompted handler used to do.
       attempted.delete(sessionID)
       lastAction.delete(sessionID)
+      // User manually resumed this turn → drop it from auto-resume so recovery won't re-continue it.
+      stalledSessions.delete(sessionID)
     }
     if (forceLimitOnce) {
       forceLimitOnce = false

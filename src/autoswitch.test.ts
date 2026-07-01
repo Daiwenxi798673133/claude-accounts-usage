@@ -23,8 +23,14 @@ mock.module("./usage.ts", () => ({
   },
   collectAllUsage: async () => ({ results: [] }),
 }))
+const dialogCalls = { exhausted: [] as unknown[][], recovery: [] as unknown[][] }
 mock.module("./dialogs.tsx", () => ({
-  openRecoveryAlert: () => {},
+  openRecoveryAlert: (...a: unknown[]) => {
+    dialogCalls.recovery.push(a)
+  },
+  openExhaustedAlert: (...a: unknown[]) => {
+    dialogCalls.exhausted.push(a)
+  },
 }))
 
 const { installAutoSwitch } = await import("./autoswitch.ts")
@@ -91,14 +97,33 @@ async function flush(pred: () => boolean): Promise<void> {
   }
 }
 
-const fireRetry = (handlers: Map<string, Handler>, id: string) =>
+const fireRetry = (handlers: Map<string, Handler>, id: string, sessionID = "s1", message = "rate limit reached") =>
   handlers.get("session.status")?.({
     id,
-    properties: { sessionID: "s1", status: { type: "retry", message: "rate limit reached" } },
+    properties: { sessionID, status: { type: "retry", message } },
   })
 
-const fireIdle = (handlers: Map<string, Handler>, id: string) =>
-  handlers.get("session.idle")?.({ id, properties: { sessionID: "s1" } })
+const fireIdle = (handlers: Map<string, Handler>, id: string, sessionID = "s1") =>
+  handlers.get("session.idle")?.({ id, properties: { sessionID } })
+
+// `data` injects the exact statusCode + responseBody Anthropic returns; defaults (429, no body) keep prior callers intact.
+const fireError = (
+  handlers: Map<string, Handler>,
+  headers: Record<string, string>,
+  sessionID = "s1",
+  id = `err-${Math.random()}`,
+  data: { statusCode?: number; responseBody?: string } = {},
+) =>
+  handlers.get("session.error")?.({
+    id,
+    properties: {
+      sessionID,
+      error: {
+        name: "APIError",
+        data: { statusCode: data.statusCode ?? 429, responseHeaders: headers, responseBody: data.responseBody },
+      },
+    },
+  })
 
 test("无缝续接:有产出回合 → promptAsync(continue),从不 revert,不弹手动重发提示", async () => {
   const { handlers, toasts, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
@@ -177,7 +202,7 @@ test("force-limit 钩子:env 设 → idle 一次性注入 → continue/resend(�
   }
 })
 
-function setupMultiStep(lastAssistantParts: unknown[]) {
+function setupMultiStepParts(a1Parts: unknown[], a2Parts: unknown[]) {
   const handlers = new Map<string, Handler>()
   const toasts: Toast[] = []
   const calls = { abort: 0, revert: [] as unknown[], promptAsync: [] as unknown[] }
@@ -188,8 +213,8 @@ function setupMultiStep(lastAssistantParts: unknown[]) {
   ]
   const parts: Record<string, unknown[]> = {
     u1: [{ type: "text", text: "hello", synthetic: false, ignored: false }],
-    a1: [{ type: "tool", tool: "read", state: { status: "completed" } }],
-    a2: lastAssistantParts,
+    a1: a1Parts,
+    a2: a2Parts,
   }
 
   const api = {
@@ -230,6 +255,144 @@ function setupMultiStep(lastAssistantParts: unknown[]) {
   const controller = installAutoSwitch(api)
   return { handlers, toasts, calls, controller }
 }
+
+function setupMultiStep(lastAssistantParts: unknown[]) {
+  return setupMultiStepParts([{ type: "tool", tool: "read", state: { status: "completed" } }], lastAssistantParts)
+}
+
+type SessionSpec = { userParts?: unknown[]; assistantSteps: unknown[][] }
+const defaultUserParts = (): unknown[] => [{ type: "text", text: "hello", synthetic: false, ignored: false }]
+
+// Per-session message/part registry so one controller can host several sessionIDs at once (C7),
+// arbitrarily many assistant steps per turn (A-real-incident), and post-resume appended steps (C8).
+function setupSessions(specs: Record<string, SessionSpec>) {
+  const handlers = new Map<string, Handler>()
+  const toasts: Toast[] = []
+  const calls = { abort: 0, revert: [] as unknown[], promptAsync: [] as unknown[] }
+  const sessionMessages = new Map<string, Array<Record<string, unknown>>>()
+  const parts: Record<string, unknown[]> = {}
+  const stepCount: Record<string, number> = {}
+
+  const pushAssistant = (sessionID: string, stepParts: unknown[]): string => {
+    const n = (stepCount[sessionID] = (stepCount[sessionID] ?? 0) + 1)
+    const id = `${sessionID}-a${n}`
+    parts[id] = stepParts
+    sessionMessages
+      .get(sessionID)
+      ?.push({ id, role: "assistant", parentID: `${sessionID}-u`, providerID: "anthropic", modelID: "claude-x", agent: "build", error: undefined })
+    return id
+  }
+
+  for (const [sessionID, spec] of Object.entries(specs)) {
+    const userId = `${sessionID}-u`
+    parts[userId] = spec.userParts ?? defaultUserParts()
+    sessionMessages.set(sessionID, [{ id: userId, role: "user", parentID: undefined }])
+    for (const stepParts of spec.assistantSteps) pushAssistant(sessionID, stepParts)
+  }
+
+  const api = {
+    event: {
+      on: (name: string, cb: Handler) => {
+        handlers.set(name, cb)
+        return () => handlers.delete(name)
+      },
+    },
+    ui: { toast: (t: Toast) => toasts.push(t), dialog: { open: false } },
+    client: {
+      app: { log: () => Promise.resolve() },
+      session: {
+        abort: async () => {
+          calls.abort++
+          return {}
+        },
+        revert: async (a: unknown) => {
+          calls.revert.push(a)
+          return { error: undefined }
+        },
+        promptAsync: async (a: unknown) => {
+          calls.promptAsync.push(a)
+          return { error: undefined }
+        },
+      },
+    },
+    state: {
+      session: {
+        messages: (sessionID: string) => sessionMessages.get(sessionID) ?? [],
+        status: () => ({ type: "idle" }),
+      },
+      part: (id: string) => parts[id] ?? [],
+    },
+    kv: { get: () => ({}), set: () => {} },
+  } as unknown as TuiPluginApi
+
+  const controller = installAutoSwitch(api)
+  return { handlers, toasts, calls, controller, pushAssistant }
+}
+
+test("A1 回归锁:多步末步空占位 [u1,a1(tool),a2(空)] 撞限 → 聚合整轮判 continue,不含原始 prompt(hello),从不 revert", async () => {
+  const { handlers, calls, controller } = setupMultiStep([])
+  fireRetry(handlers, "evt-A1-empty-tail")
+  await flush(() => calls.promptAsync.length > 0)
+
+  expect(calls.promptAsync.length).toBe(1)
+  const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "hello")).toBe(false)
+  expect(calls.revert.length).toBe(0)
+  controller.dispose()
+})
+
+test("A2:多步 [u1,a1(reasoning),a2(空)] → continue,从不 revert", async () => {
+  const { handlers, calls, controller } = setupMultiStepParts([{ type: "reasoning" }], [])
+  fireRetry(handlers, "evt-A2-reasoning")
+  await flush(() => calls.promptAsync.length > 0)
+
+  expect(calls.promptAsync.length).toBe(1)
+  const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "hello")).toBe(false)
+  expect(calls.revert.length).toBe(0)
+  controller.dispose()
+})
+
+test("A3:多步 [u1,a1(patch),a2(空)] → continue,从不 revert", async () => {
+  const { handlers, calls, controller } = setupMultiStepParts([{ type: "patch" }], [])
+  fireRetry(handlers, "evt-A3-patch")
+  await flush(() => calls.promptAsync.length > 0)
+
+  expect(calls.promptAsync.length).toBe(1)
+  const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "hello")).toBe(false)
+  expect(calls.revert.length).toBe(0)
+  controller.dispose()
+})
+
+test("A4:多步 [u1,a1(非空text),a2(空)] → continue,从不 revert", async () => {
+  const { handlers, calls, controller } = setupMultiStepParts([{ type: "text", text: "已经分析了一半" }], [])
+  fireRetry(handlers, "evt-A4-text")
+  await flush(() => calls.promptAsync.length > 0)
+
+  expect(calls.promptAsync.length).toBe(1)
+  const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "hello")).toBe(false)
+  expect(calls.revert.length).toBe(0)
+  controller.dispose()
+})
+
+test("A6:多步全程空 [u1,a1(空),a2(空)] → resend 原始 prompt(hello),从不 revert", async () => {
+  const { handlers, calls, controller } = setupMultiStepParts([], [])
+  fireRetry(handlers, "evt-A6-allempty")
+  await flush(() => calls.promptAsync.length > 0)
+
+  expect(calls.promptAsync.length).toBe(1)
+  const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "hello")).toBe(true)
+  expect(arg.parts.some((p) => p.text === "continue")).toBe(false)
+  expect(calls.revert.length).toBe(0)
+  controller.dispose()
+})
 
 test("多步回合(一 user 多 assistant)撞限 → 命中最后一条 assistant → promptAsync(continue),从不 revert,无手动重发提示", async () => {
   const { handlers, toasts, calls, controller } = setupMultiStep([{ type: "tool", tool: "edit", state: { status: "completed" } }])
@@ -284,6 +447,291 @@ test("仅剩标记号:撞限 → standDown(不切到标记号、零 promptAsync�
     expect(switchCalls.length).toBe(0)
     expect(calls.promptAsync.length).toBe(0)
     expect(toasts.some((t) => t.variant === "error" && t.message.includes("额度上限"))).toBe(true)
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("C1:仅剩 excluded → standdown 弹 openExhaustedAlert 一次,零 promptAsync,零 switch", async () => {
+  switchCalls.length = 0
+  dialogCalls.exhausted.length = 0
+  accountsOverride = {
+    accounts: [
+      { id: "acc1", label: "A" },
+      { id: "acc2", label: "B", excluded: true },
+    ],
+    activeId: "acc1",
+  }
+  try {
+    const { handlers, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    fireRetry(handlers, "evt-C1")
+    await flush(() => dialogCalls.exhausted.length > 0)
+
+    expect(dialogCalls.exhausted.length).toBe(1)
+    expect(calls.promptAsync.length).toBe(0)
+    expect(switchCalls.length).toBe(0)
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("C3:standdown 弹窗携带最近恢复倒计时(soonestMs 为正数)", async () => {
+  dialogCalls.exhausted.length = 0
+  accountsOverride = {
+    accounts: [
+      { id: "acc1", label: "A" },
+      { id: "acc2", label: "B", excluded: true },
+    ],
+    activeId: "acc1",
+  }
+  try {
+    const { handlers, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    fireRetry(handlers, "evt-C3")
+    await flush(() => dialogCalls.exhausted.length > 0)
+
+    const args = dialogCalls.exhausted[0] as unknown[]
+    expect(typeof args[1]).toBe("number")
+    expect(args[1] as number).toBeGreaterThan(0)
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("C4【headline】恢复计时到点 + 有停摆 → switchToAccount(恢复号) + promptAsync(continue)", async () => {
+  switchCalls.length = 0
+  dialogCalls.exhausted.length = 0
+  accountsOverride = {
+    accounts: [
+      { id: "acc1", label: "A" },
+      { id: "acc2", label: "B", excluded: true },
+    ],
+    activeId: "acc1",
+  }
+  try {
+    const { handlers, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    fireError(handlers, {
+      "anthropic-ratelimit-unified-status": "rejected",
+      "anthropic-ratelimit-unified-reset": String((Date.now() + 60) / 1000),
+    })
+    await flush(() => calls.promptAsync.length > 0)
+
+    expect(switchCalls).toContain("acc1")
+    expect(calls.promptAsync.length).toBe(1)
+    const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+    expect(arg.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("C5:恢复 + 无停摆 → openRecoveryAlert,恢复不触发额外 switch/promptAsync", async () => {
+  switchCalls.length = 0
+  dialogCalls.recovery.length = 0
+  const { handlers, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+  fireError(handlers, {
+    "anthropic-ratelimit-unified-status": "rejected",
+    "anthropic-ratelimit-unified-reset": String((Date.now() + 80) / 1000),
+  })
+  await flush(() => switchCalls.length > 0)
+  const switchAfterSwitch = switchCalls.length
+  const promptAfterSwitch = calls.promptAsync.length
+
+  await flush(() => dialogCalls.recovery.length > 0)
+  expect(dialogCalls.recovery.length).toBe(1)
+  expect(switchCalls.length).toBe(switchAfterSwitch)
+  expect(calls.promptAsync.length).toBe(promptAfterSwitch)
+  controller.dispose()
+})
+
+test("C6:防二次续接 — 先停摆,fireIdle 成功移出停摆,恢复时不再 promptAsync", async () => {
+  switchCalls.length = 0
+  dialogCalls.exhausted.length = 0
+  dialogCalls.recovery.length = 0
+  accountsOverride = {
+    accounts: [
+      { id: "acc1", label: "A" },
+      { id: "acc2", label: "B", excluded: true },
+    ],
+    activeId: "acc1",
+  }
+  try {
+    const { handlers, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    fireError(handlers, {
+      "anthropic-ratelimit-unified-status": "rejected",
+      "anthropic-ratelimit-unified-reset": String((Date.now() + 150) / 1000),
+    })
+    await flush(() => dialogCalls.exhausted.length > 0)
+
+    accountsOverride.activeId = "acc2"
+    fireIdle(handlers, "evt-C6-idle")
+    await flush(() => dialogCalls.recovery.length > 0)
+
+    expect(dialogCalls.recovery.length).toBe(1)
+    expect(calls.promptAsync.length).toBe(0)
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("B1-real-429-body:响应体 rate_limit_error(流式 SSE error,status 200)→ 经 fireError 实测触发切号到 acc2", async () => {
+  switchCalls.length = 0
+  const { handlers, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+  fireError(handlers, {}, "s1", undefined, {
+    statusCode: 200,
+    responseBody: '{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}}',
+  })
+  await flush(() => switchCalls.length > 0)
+
+  expect(switchCalls).toContain("acc2")
+  await flush(() => calls.promptAsync.length > 0)
+  const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
+  controller.dispose()
+})
+
+test("B2-real-unified-header:头 anthropic-ratelimit-unified-status=rejected(无 429、无 body)→ 触发切号到 acc2", async () => {
+  switchCalls.length = 0
+  const { handlers, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+  fireError(handlers, { "anthropic-ratelimit-unified-status": "rejected" }, "s1", undefined, { statusCode: 200 })
+  await flush(() => switchCalls.length > 0)
+
+  expect(switchCalls).toContain("acc2")
+  controller.dispose()
+})
+
+test("B3-real-message-text:纯消息文案(retry 路径,无头无体)→ 触发切号到 acc2", async () => {
+  switchCalls.length = 0
+  const { handlers, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+  fireRetry(handlers, "evt-B3", "s1", "This request would exceed your account's rate limit. Please try again later.")
+  await flush(() => switchCalls.length > 0)
+
+  expect(switchCalls).toContain("acc2")
+  await flush(() => calls.promptAsync.length > 0)
+  expect(calls.abort).toBe(1)
+  const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
+  controller.dispose()
+})
+
+test("B4-real-429-status:仅 429 statusCode(无头无体)→ 触发切号到 acc2", async () => {
+  switchCalls.length = 0
+  const { handlers, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+  fireError(handlers, {}, "s1", undefined, { statusCode: 429 })
+  await flush(() => switchCalls.length > 0)
+
+  expect(switchCalls).toContain("acc2")
+  controller.dispose()
+})
+
+test("B5-real-529-overloaded:overloaded_error 响应体(529 类)→ 不切号、零 promptAsync、零 standdown", async () => {
+  switchCalls.length = 0
+  dialogCalls.exhausted.length = 0
+  const { handlers, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+  fireError(handlers, {}, "s1", undefined, {
+    statusCode: 529,
+    responseBody: '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
+  })
+  await flush(() => false)
+
+  expect(switchCalls.length).toBe(0)
+  expect(calls.promptAsync.length).toBe(0)
+  expect(dialogCalls.exhausted.length).toBe(0)
+  controller.dispose()
+})
+
+test("A-real-incident-shape:忠实复刻 ses_0e8b04 07:38(长 prompt + reasoning/tool/text/patch 多步 + 末步空占位)撞限 → 聚合判 continue,不含原始 prompt,从不 revert", async () => {
+  const longPrompt =
+    "请看这个飞书文档链接 https://example.feishu.cn/docx/abcd1234efgh5678 帮我把里面的需求整理成结构化清单,并落地到 src 下对应模块,注意保留既有的限流自动切号逻辑不要破坏。"
+  const { handlers, calls, controller } = setupSessions({
+    s1: {
+      userParts: [{ type: "text", text: longPrompt, synthetic: false, ignored: false }],
+      assistantSteps: [
+        [{ type: "reasoning" }],
+        [{ type: "tool", tool: "read", state: { status: "completed" } }],
+        [{ type: "text", text: "我已经读完文档,接下来开始编辑对应模块" }],
+        [{ type: "tool", tool: "edit", state: { status: "completed" } }, { type: "patch" }],
+        [],
+      ],
+    },
+  })
+  fireRetry(handlers, "evt-A-incident", "s1")
+  await flush(() => calls.promptAsync.length > 0)
+
+  expect(calls.promptAsync.length).toBe(1)
+  const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+  expect(arg.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
+  expect(arg.parts.some((p) => p.type === "text" && p.text === longPrompt)).toBe(false)
+  expect(calls.revert.length).toBe(0)
+  controller.dispose()
+})
+
+test("C7:两个 session 都停摆 + 单号恢复 → 逐个续接(对两个 session 各 promptAsync(continue) 一次)", async () => {
+  switchCalls.length = 0
+  dialogCalls.exhausted.length = 0
+  accountsOverride = {
+    accounts: [
+      { id: "acc1", label: "A" },
+      { id: "acc2", label: "B", excluded: true },
+    ],
+    activeId: "acc1",
+  }
+  try {
+    const { handlers, calls, controller } = setupSessions({
+      sA: { assistantSteps: [[{ type: "tool", tool: "read", state: { status: "completed" } }]] },
+      sB: { assistantSteps: [[{ type: "tool", tool: "edit", state: { status: "completed" } }]] },
+    })
+    const reset = String((Date.now() + 200) / 1000)
+    fireError(handlers, { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": reset }, "sA")
+    fireError(handlers, { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": reset }, "sB")
+    await flush(() => dialogCalls.exhausted.length >= 2)
+
+    await flush(() => calls.promptAsync.length >= 2)
+    expect(calls.promptAsync.length).toBe(2)
+    const sessions = (calls.promptAsync as { sessionID: string; parts: { type: string; text?: string }[] }[]).map((a) => a.sessionID)
+    expect(sessions).toContain("sA")
+    expect(sessions).toContain("sB")
+    for (const a of calls.promptAsync as { parts: { type: string; text?: string }[] }[]) {
+      expect(a.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
+    }
+    expect(switchCalls).toContain("acc1")
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("C8:恢复-续接后同 session 再撞限(全员 excluded/cooled)→ 重新停摆 → 二次恢复再次续接(自愈)", async () => {
+  switchCalls.length = 0
+  dialogCalls.exhausted.length = 0
+  accountsOverride = {
+    accounts: [
+      { id: "acc1", label: "A" },
+      { id: "acc2", label: "B", excluded: true },
+    ],
+    activeId: "acc1",
+  }
+  try {
+    const { handlers, calls, controller, pushAssistant } = setupSessions({
+      sX: { assistantSteps: [[{ type: "tool", tool: "read", state: { status: "completed" } }]] },
+    })
+    fireError(handlers, { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String((Date.now() + 120) / 1000) }, "sX")
+    await flush(() => dialogCalls.exhausted.length >= 1)
+    await flush(() => calls.promptAsync.length >= 1)
+    expect((calls.promptAsync[0] as { parts: { text?: string }[] }).parts.some((p) => p.text === "continue")).toBe(true)
+
+    pushAssistant("sX", [{ type: "tool", tool: "edit", state: { status: "completed" } }])
+    fireError(handlers, { "anthropic-ratelimit-unified-status": "rejected", "anthropic-ratelimit-unified-reset": String((Date.now() + 120) / 1000) }, "sX")
+    await flush(() => dialogCalls.exhausted.length >= 2)
+    expect(dialogCalls.exhausted.length).toBe(2)
+
+    await flush(() => calls.promptAsync.length >= 2)
+    expect(calls.promptAsync.length).toBe(2)
+    expect((calls.promptAsync[1] as { parts: { text?: string }[] }).parts.some((p) => p.text === "continue")).toBe(true)
     controller.dispose()
   } finally {
     accountsOverride = undefined
