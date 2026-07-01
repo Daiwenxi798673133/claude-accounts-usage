@@ -488,6 +488,11 @@ test("C3:standdown 弹窗携带最近恢复倒计时(soonestMs 为正数)", asyn
   }
   try {
     const { handlers, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    // A known reset (cached future resets_at) is required for a countdown; without it the honest
+    // behavior is soonestMs === undefined (locked separately by the only-pending standDown test).
+    controller.setUsageCache([
+      { id: "acc1", label: "A", active: true, usage: { five_hour: { utilization: 100, resets_at: new Date(Date.now() + 60_000).toISOString() } } },
+    ])
     fireRetry(handlers, "evt-C3")
     await flush(() => dialogCalls.exhausted.length > 0)
 
@@ -732,6 +737,214 @@ test("C8:恢复-续接后同 session 再撞限(全员 excluded/cooled)→ 重新
     await flush(() => calls.promptAsync.length >= 2)
     expect(calls.promptAsync.length).toBe(2)
     expect((calls.promptAsync[1] as { parts: { text?: string }[] }).parts.some((p) => p.text === "continue")).toBe(true)
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+const usageEntry = (id: string, usage: Record<string, unknown>) => ({ id, label: id.toUpperCase(), active: true, usage })
+const isoIn = (ms: number) => new Date(Date.now() + ms).toISOString()
+
+test("I28-a:未知冷却(无头无缓存)→ 切到备号、待定账号被排除、不安排恢复、无 Infinity/NaN", async () => {
+  switchCalls.length = 0
+  dialogCalls.recovery.length = 0
+  dialogCalls.exhausted.length = 0
+  const { handlers, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+  controller.setUsageCache([])
+  fireRetry(handlers, "evt-I28-a")
+  await flush(() => switchCalls.length > 0)
+  expect(switchCalls).toContain("acc2")
+  await flush(() => calls.promptAsync.length > 0)
+  await new Promise((r) => setTimeout(r, 30))
+  expect(dialogCalls.recovery.length).toBe(0)
+  for (const args of dialogCalls.exhausted) {
+    const v = args[1] as number | undefined
+    expect(v === undefined || (typeof v === "number" && Number.isFinite(v))).toBe(true)
+  }
+  controller.dispose()
+})
+
+test("I28-b:仅剩待定冷却账号 → standDown soonestMs===undefined、无 Infinity", async () => {
+  switchCalls.length = 0
+  dialogCalls.exhausted.length = 0
+  accountsOverride = { accounts: [{ id: "acc1", label: "A" }], activeId: "acc1" }
+  try {
+    const { handlers, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    controller.setUsageCache([])
+    fireRetry(handlers, "evt-I28-b")
+    await flush(() => dialogCalls.exhausted.length > 0)
+    expect((dialogCalls.exhausted[0] as unknown[])[1]).toBe(undefined)
+    expect(switchCalls.length).toBe(0)
+    expect(calls.promptAsync.length).toBe(0)
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("I28-i:onIdle 成功回合清除待定冷却 → 账号重新可选", async () => {
+  switchCalls.length = 0
+  dialogCalls.exhausted.length = 0
+  accountsOverride = { accounts: [{ id: "acc1", label: "A" }, { id: "acc2", label: "B", excluded: true }], activeId: "acc1" }
+  try {
+    const { handlers, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    controller.setUsageCache([])
+    fireRetry(handlers, "evt-I28-i-cool")
+    await flush(() => dialogCalls.exhausted.length > 0)
+    expect(switchCalls.length).toBe(0)
+
+    fireIdle(handlers, "evt-I28-i-idle")
+    await new Promise((r) => setTimeout(r, 10))
+
+    accountsOverride.activeId = "acc2"
+    fireRetry(handlers, "evt-I28-i-reuse", "s2")
+    await flush(() => switchCalls.length > 0)
+    expect(switchCalls).toContain("acc1")
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("I28-c:status 路径用缓存 resets_at → 恢复在真实 reset 触发(非 ~1ms 假恢复)", async () => {
+  switchCalls.length = 0
+  dialogCalls.recovery.length = 0
+  const { handlers, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+  controller.setUsageCache([usageEntry("acc1", { five_hour: { utilization: 100, resets_at: isoIn(200) } })])
+  fireRetry(handlers, "evt-I28-c")
+  await flush(() => calls.promptAsync.length > 0)
+  expect(switchCalls).toContain("acc2")
+  expect(dialogCalls.recovery.length).toBe(0)
+  await flush(() => dialogCalls.recovery.length > 0)
+  expect(dialogCalls.recovery.length).toBe(1)
+  controller.dispose()
+})
+
+test("I28-d:响应头 reset 优先于缓存 resets_at", async () => {
+  switchCalls.length = 0
+  dialogCalls.recovery.length = 0
+  const { handlers, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+  controller.setUsageCache([usageEntry("acc1", { five_hour: { utilization: 100, resets_at: isoIn(5_000) } })])
+  fireError(handlers, {
+    "anthropic-ratelimit-unified-status": "rejected",
+    "anthropic-ratelimit-unified-reset": String((Date.now() + 150) / 1000),
+  })
+  await flush(() => calls.promptAsync.length > 0)
+  expect(switchCalls).toContain("acc2")
+  expect(dialogCalls.recovery.length).toBe(0)
+  await flush(() => dialogCalls.recovery.length > 0)
+  expect(dialogCalls.recovery.length).toBe(1)
+  controller.dispose()
+})
+
+test("I28-e1:过期缓存 resets_at 被忽略 → 未知(待定)、无恢复", async () => {
+  switchCalls.length = 0
+  dialogCalls.recovery.length = 0
+  dialogCalls.exhausted.length = 0
+  accountsOverride = { accounts: [{ id: "acc1", label: "A" }, { id: "acc2", label: "B", excluded: true }], activeId: "acc1" }
+  try {
+    const { handlers, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    controller.setUsageCache([usageEntry("acc1", { five_hour: { utilization: 100, resets_at: isoIn(-1_000) } })])
+    fireRetry(handlers, "evt-I28-e1")
+    await flush(() => dialogCalls.exhausted.length > 0)
+    expect((dialogCalls.exhausted[0] as unknown[])[1]).toBe(undefined)
+    await new Promise((r) => setTimeout(r, 30))
+    expect(dialogCalls.recovery.length).toBe(0)
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("I28-f:多窗口顶格 → 取最晚 resets_at", async () => {
+  dialogCalls.exhausted.length = 0
+  accountsOverride = { accounts: [{ id: "acc1", label: "A" }, { id: "acc2", label: "B", excluded: true }], activeId: "acc1" }
+  try {
+    const { handlers, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    controller.setUsageCache([
+      usageEntry("acc1", {
+        five_hour: { utilization: 100, resets_at: isoIn(100) },
+        seven_day: { utilization: 100, resets_at: isoIn(300) },
+      }),
+    ])
+    fireRetry(handlers, "evt-I28-f")
+    await flush(() => dialogCalls.exhausted.length > 0)
+    const v = (dialogCalls.exhausted[0] as unknown[])[1]
+    expect(typeof v).toBe("number")
+    expect(v as number).toBeGreaterThan(250)
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("I28-g:待定冷却经 setUsageCache 回填真实 reset → 升级为精确恢复", async () => {
+  switchCalls.length = 0
+  dialogCalls.exhausted.length = 0
+  dialogCalls.recovery.length = 0
+  accountsOverride = { accounts: [{ id: "acc1", label: "A" }, { id: "acc2", label: "B", excluded: true }], activeId: "acc1" }
+  try {
+    const { handlers, calls, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    controller.setUsageCache([])
+    fireRetry(handlers, "evt-I28-g")
+    await flush(() => dialogCalls.exhausted.length > 0)
+    expect(switchCalls.length).toBe(0)
+    expect(dialogCalls.recovery.length).toBe(0)
+
+    controller.setUsageCache([usageEntry("acc1", { five_hour: { utilization: 100, resets_at: isoIn(150) } })])
+    await flush(() => switchCalls.length > 0)
+    expect(switchCalls).toContain("acc1")
+    await flush(() => calls.promptAsync.length > 0)
+    const arg = calls.promptAsync[0] as { parts: { type: string; text?: string }[] }
+    expect(arg.parts.some((p) => p.type === "text" && p.text === "continue")).toBe(true)
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("I28-h:待定冷却经 setUsageCache 发现已恢复(低用量)→ 清除、无恢复、重新可选", async () => {
+  switchCalls.length = 0
+  dialogCalls.exhausted.length = 0
+  dialogCalls.recovery.length = 0
+  accountsOverride = { accounts: [{ id: "acc1", label: "A" }, { id: "acc2", label: "B", excluded: true }], activeId: "acc1" }
+  try {
+    const { handlers, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    controller.setUsageCache([])
+    fireRetry(handlers, "evt-I28-h")
+    await flush(() => dialogCalls.exhausted.length > 0)
+
+    controller.setUsageCache([usageEntry("acc1", { five_hour: { utilization: 20, resets_at: isoIn(5_000) } })])
+    await new Promise((r) => setTimeout(r, 30))
+    expect(switchCalls.length).toBe(0)
+    expect(dialogCalls.recovery.length).toBe(0)
+
+    accountsOverride.activeId = "acc2"
+    fireRetry(handlers, "evt-I28-h-reuse", "s2")
+    await flush(() => switchCalls.length > 0)
+    expect(switchCalls).toContain("acc1")
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("I28-e2:待定冷却 + 全 null 窗口用量 → 清除(无 Infinity/NaN 定时器、无恢复)", async () => {
+  switchCalls.length = 0
+  dialogCalls.exhausted.length = 0
+  dialogCalls.recovery.length = 0
+  accountsOverride = { accounts: [{ id: "acc1", label: "A" }, { id: "acc2", label: "B", excluded: true }], activeId: "acc1" }
+  try {
+    const { handlers, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    controller.setUsageCache([])
+    fireRetry(handlers, "evt-I28-e2")
+    await flush(() => dialogCalls.exhausted.length > 0)
+
+    controller.setUsageCache([usageEntry("acc1", { five_hour: null, seven_day: null, seven_day_sonnet: null, seven_day_opus: null })])
+    await new Promise((r) => setTimeout(r, 30))
+    expect(switchCalls.length).toBe(0)
+    expect(dialogCalls.recovery.length).toBe(0)
     controller.dispose()
   } finally {
     accountsOverride = undefined
