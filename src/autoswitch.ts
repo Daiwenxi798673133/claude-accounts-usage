@@ -7,7 +7,6 @@ import { decideRedo, type PartLike } from "./continuation.ts"
 import { collectAllUsage, switchToAccount, type AccountUsage, type UsageResponse } from "./usage.ts"
 
 const ENABLED = true
-const DEFAULT_COOLDOWN_MS = 60 * 60_000
 const USAGE_CACHE_TTL_MS = 10 * 60_000
 const RECENT_SWITCH_GUARD_MS = 4_000
 const IDLE_WAIT_TIMEOUT_MS = 8_000
@@ -110,6 +109,9 @@ function sleep(ms: number): Promise<void> {
 
 export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   const cooldown = new Map<string, number>()
+  // Cooled without a known reset deadline. The SOLE encoding of "unknown when" — never a sentinel
+  // in `cooldown`, never passed to scheduleRecovery (a bogus timer clamps to ~1ms = false recovery).
+  const cooldownPending = new Set<string>()
   const recoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
   const pendingRecovered = new Map<string, string>()
   let recoveryRetryTimer: ReturnType<typeof setTimeout> | undefined
@@ -199,11 +201,17 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   }
 
   function markCooldown(id: string, untilMs?: number): void {
-    const until = untilMs ?? Date.now() + DEFAULT_COOLDOWN_MS
-    cooldown.set(id, until)
-    persistCooldown()
-    scheduleRecovery(id, until)
-    log.info("autoswitch:cooldown-enter", { id, until })
+    if (typeof untilMs === "number" && Number.isFinite(untilMs)) {
+      cooldownPending.delete(id)
+      cooldown.set(id, untilMs)
+      persistCooldown()
+      scheduleRecovery(id, untilMs)
+      log.info("autoswitch:cooldown-enter", { id, until: untilMs })
+      return
+    }
+    cooldown.delete(id)
+    cooldownPending.add(id)
+    log.info("autoswitch:cooldown-indefinite", { id })
   }
 
   function clearCooldown(id: string): void {
@@ -213,6 +221,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       recoveryTimers.delete(id)
     }
     pendingRecovered.delete(id)
+    cooldownPending.delete(id)
     if (cooldown.delete(id)) {
       persistCooldown()
       log.info("autoswitch:cooldown-clear", { id })
@@ -220,8 +229,34 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   }
 
   function isCooled(id: string, now: number): boolean {
+    if (cooldownPending.has(id)) return true
     const until = cooldown.get(id)
     return typeof until === "number" && until > now
+  }
+
+  // Deadline: (1) server header; else (2) the account's binding-window FUTURE resets_at from cache.
+  // resets_at is absolute wall-clock, so USAGE_CACHE_TTL_MS is intentionally NOT applied. Binding =
+  // a window at the limit (util >= 100); not-maxed ⇒ undefined (honest unknown). Multiple maxed
+  // windows ⇒ the LATEST reset (never announce recovery before the last binding window clears).
+  function resolveResetMs(error: RetryErrorLike, id?: string): number | undefined {
+    const header = parseResetMs(error)
+    if (header !== undefined) return header
+    if (!id) return undefined
+    const usage = usageCache.byId.get(id)
+    if (!usage) return undefined
+    const now = Date.now()
+    const candidates: { util: number; at: number }[] = []
+    for (const win of [usage.five_hour, usage.seven_day, usage.seven_day_sonnet, usage.seven_day_opus]) {
+      if (!win || win.resets_at === undefined) continue
+      const at = Date.parse(win.resets_at)
+      if (!Number.isFinite(at) || at <= now) continue
+      candidates.push({ util: win.utilization, at })
+    }
+    if (candidates.length === 0) return undefined
+    const maxUtil = Math.max(...candidates.map((c) => c.util))
+    if (maxUtil < 100) return undefined
+    const tied = candidates.filter((c) => c.util >= maxUtil - 0.5)
+    return Math.max(...tied.map((c) => c.at))
   }
 
   const stored = api.kv.get<Record<string, number>>(COOLDOWN_KV_KEY, {})
@@ -238,6 +273,16 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     const byId = new Map<string, UsageResponse>()
     for (const result of results) if (result.usage) byId.set(result.id, result.usage)
     usageCache = { at: Date.now(), byId }
+    // Sole clearing path for indefinite cooldowns: a fresh snapshot either supplies the real reset
+    // (upgrade to a timed cooldown + accurate recovery) or shows the account is no longer maxed
+    // (clear it). Lives here so it fires for BOTH /usage and the background refresh (the caller-side
+    // `refreshing` guard would skip it).
+    for (const id of [...cooldownPending]) {
+      if (!cooldownPending.has(id)) continue
+      const at = resolveResetMs({}, id)
+      if (at !== undefined) markCooldown(id, at)
+      else clearCooldown(id)
+    }
   }
 
   async function refreshUsageInBackground(): Promise<void> {
@@ -340,7 +385,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   }
 
   async function doSwitch(sessionID: string, error: RetryErrorLike, activeId?: string): Promise<boolean> {
-    if (activeId) markCooldown(activeId, parseResetMs(error))
+    if (activeId) markCooldown(activeId, resolveResetMs(error, activeId))
 
     const file = await loadAccounts()
     const tried = attempted.get(sessionID) ?? new Set<string>()
