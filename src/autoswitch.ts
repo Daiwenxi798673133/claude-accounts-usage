@@ -289,7 +289,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     if (refreshing) return
     refreshing = true
     try {
-      const { results } = await collectAllUsage()
+      const { results } = await collectAllUsage({ isSessionRunning: () => true })
       setUsageCache(results)
     } catch {
       // best-effort cache warming; selection falls back to round-robin

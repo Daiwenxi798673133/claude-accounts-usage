@@ -50,7 +50,7 @@ const tui: TuiPlugin = async (api) => {
   const refreshUsage = async () => {
     try {
       await autoCapture()
-      const { results } = await collectAllUsage()
+      const { results } = await collectAllUsage({ isSessionRunning: () => true })
       autoSwitch.setUsageCache(results)
       setState({ loading: false, results, updatedAt: Date.now() })
     } catch (error) {

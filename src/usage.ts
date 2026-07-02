@@ -39,7 +39,10 @@ export type ActiveTokenOutcome = {
 }
 
 export type CollectOptions = {
-  isSessionRunning?: () => boolean
+  // REQUIRED (INV-1): omitting the predicate MUST be a compile error, never a
+  // silent "assume idle" that would let the plugin self-refresh the active chain.
+  // Unknown-state callers pass `() => true` (assume running → never self-refresh).
+  isSessionRunning: () => boolean
   onPartial?: (results: AccountUsage[]) => void
 }
 
@@ -215,46 +218,155 @@ export async function acquireActiveAccess(active: StoredAccount, isSessionRunnin
   return withAuthLock(() => selfRefresh(auth, isSessionRunning))
 }
 
-export async function collectAllUsage(): Promise<{ activeId?: string; results: AccountUsage[] }> {
+// Last-good active usage, kept module-level so a deferred/unavailable active row can
+// still render recent data (INV-8). Updated on EVERY successful active fetchUsage.
+let lastActiveUsage: { usage: UsageResponse; at: number } | undefined
+
+// A cached window whose reset moment has already passed is no longer "current" — drop
+// it (null) rather than render a stale bar as if it were live (INV-8, G11).
+function pruneUsage(usage: UsageResponse): UsageResponse {
+  const now = Date.now()
+  const keep = (window: UsageWindow | null | undefined): UsageWindow | null =>
+    window && window.resets_at && Date.parse(window.resets_at) < now ? null : (window ?? null)
+  return {
+    five_hour: keep(usage.five_hour),
+    seven_day: keep(usage.seven_day),
+    seven_day_sonnet: keep(usage.seven_day_sonnet),
+    seven_day_opus: keep(usage.seven_day_opus),
+  }
+}
+
+function cachedActiveRow(base: { id: string; label: string; active: boolean }, fallbackError: string): AccountUsage {
+  if (lastActiveUsage) return { ...base, usage: pruneUsage(lastActiveUsage.usage), usageAsOf: lastActiveUsage.at }
+  return { ...base, error: fallbackError }
+}
+
+export async function collectAllUsage(opts: CollectOptions): Promise<{ activeId?: string; results: AccountUsage[] }> {
+  const { isSessionRunning, onPartial } = opts
   const file = await loadAccounts()
+  const auth = await readAuthAnthropic()
 
-  const settled: { result: AccountUsage; updated?: StoredAccount }[] = []
+  const activeRecord = file.activeId ? file.accounts.find((account) => account.id === file.activeId) : undefined
+  const hasActive = Boolean(activeRecord) || Boolean(auth)
+  const activeBase = {
+    id: activeRecord?.id ?? file.activeId ?? "active",
+    label: activeRecord?.label ?? "当前账号",
+    active: true,
+  }
+
+  // INACTIVE accounts (everything that is NOT the auth-held/active one): existing
+  // behavior verbatim — proactive 30-min refresh, writes accounts.json only (INV-3).
+  const inactiveAccounts = file.accounts.filter((account) => account !== activeRecord)
+  const inactiveResults = new Map<string, AccountUsage>()
+  const updated: StoredAccount[] = []
   let needsRefresh = false
-
-  for (const account of file.accounts) {
-    const base = { id: account.id, label: account.label, active: account.id === file.activeId }
-    const bufferMs = account.id === file.activeId ? TOKEN_EXPIRY_BUFFER_MS : INACTIVE_REFRESH_THRESHOLD_MS
+  for (let index = 0; index < inactiveAccounts.length; index++) {
+    const account = inactiveAccounts[index]
+    const base = { id: account.id, label: account.label, active: false }
     try {
-      const { access, updated } = await ensureFresh(account, bufferMs)
-      if (updated) needsRefresh = true
-      if (!access) {
-        settled.push({ result: { ...base, error: "missing access token" }, updated })
-        continue
+      const { access, updated: fresh } = await ensureFresh(account, INACTIVE_REFRESH_THRESHOLD_MS)
+      if (fresh) {
+        needsRefresh = true
+        updated.push(fresh)
       }
-      const usage = await fetchUsage(access)
-      settled.push({ result: { ...base, usage }, updated })
+      if (!access) {
+        inactiveResults.set(account.id, { ...base, error: "missing access token" })
+      } else {
+        const usage = await fetchUsage(access)
+        inactiveResults.set(account.id, { ...base, usage })
+      }
     } catch (error) {
       log.warn("usage:collect-account-fail", { label: account.label, error: errorMessage(error) })
-      settled.push({ result: { ...base, error: errorMessage(error) } })
+      inactiveResults.set(account.id, { ...base, error: errorMessage(error) })
     }
-    if (needsRefresh && file.accounts.indexOf(account) < file.accounts.length - 1) {
+    if (needsRefresh && index < inactiveAccounts.length - 1) {
       await sleep(REFRESH_DELAY_MS)
     }
   }
 
-  const updated = settled.flatMap((entry) => (entry.updated ? [entry.updated] : []))
-  if (updated.length > 0) {
+  // ACTIVE account: auth.json is the SINGLE source of truth (INV-2/4/5). FRESH → fetch
+  // now (real-time); EXPIRED → defer to the resolve phase; no anthropic token → cached
+  // or "未登录". The auth-held chain NEVER enters ensureFresh.
+  let activeAuth: AuthToken | undefined = toAuthToken(auth)
+  let activeFast: AccountUsage | undefined
+  let activeDeferred = false
+  if (hasActive) {
+    if (!auth) {
+      activeFast = cachedActiveRow(activeBase, "未登录")
+    } else if (isActiveFresh(auth)) {
+      try {
+        const usage = await fetchUsage(auth.access)
+        lastActiveUsage = { usage, at: Date.now() }
+        activeFast = { ...activeBase, usage }
+      } catch (error) {
+        log.warn("usage:collect-active-fail", { error: errorMessage(error) })
+        activeFast = { ...activeBase, error: errorMessage(error) }
+      }
+    } else {
+      activeFast = { ...activeBase, pending: isSessionRunning() ? "waiting-refresh" : "refreshing" }
+      activeDeferred = true
+    }
+  }
+
+  const fastResults: AccountUsage[] = []
+  if (activeRecord) {
+    for (const account of file.accounts) {
+      fastResults.push(account === activeRecord ? activeFast! : inactiveResults.get(account.id)!)
+    }
+  } else {
+    if (activeFast) fastResults.push(activeFast)
+    for (const account of file.accounts) fastResults.push(inactiveResults.get(account.id)!)
+  }
+  onPartial?.(fastResults)
+
+  let activeResolved = activeFast
+  if (activeDeferred) {
+    const activeStored: StoredAccount = activeRecord ?? { id: activeBase.id, label: activeBase.label, refresh: auth?.refresh ?? "" }
+    const outcome = await acquireActiveAccess(activeStored, isSessionRunning)
+    if (outcome.access) {
+      try {
+        const usage = await fetchUsage(outcome.access)
+        lastActiveUsage = { usage, at: Date.now() }
+        activeResolved = { ...activeBase, usage }
+      } catch (error) {
+        log.warn("usage:collect-active-fail", { error: errorMessage(error) })
+        activeResolved = cachedActiveRow(activeBase, errorMessage(error))
+      }
+    } else {
+      activeResolved = cachedActiveRow(activeBase, "额度暂不可用(等待 token 刷新)")
+    }
+    activeAuth = outcome.authToken ?? activeAuth
+  }
+
+  const results = fastResults.map((row) => (row === activeFast ? activeResolved! : row))
+
+  // REVERSE-SYNC (auth.json → accounts.json only) + persist inactive updates, under a
+  // SEPARATE lock from acquireActiveAccess's (INV-6, never nested). The active record's
+  // token is overwritten from activeAuth — a value that always originated in auth.json.
+  const doActiveSync = Boolean(activeRecord && activeAuth?.refresh)
+  if (updated.length > 0 || doActiveSync) {
     await withAuthLock(async () => {
       const current = await loadAccounts()
       for (const account of updated) {
         const index = current.accounts.findIndex((existing) => existing.id === account.id)
         if (index >= 0) current.accounts[index] = { ...current.accounts[index], ...account }
       }
+      if (doActiveSync && activeRecord && activeAuth) {
+        const index = current.accounts.findIndex((existing) => existing.id === activeRecord.id)
+        if (index >= 0) {
+          current.accounts[index] = {
+            ...current.accounts[index],
+            refresh: activeAuth.refresh,
+            access: activeAuth.access,
+            expires: activeAuth.expires,
+          }
+        }
+      }
       await saveAccounts(current)
     })
   }
 
-  return { activeId: file.activeId, results: settled.map((entry) => entry.result) }
+  return { activeId: file.activeId, results }
 }
 
 export async function switchToAccount(id: string): Promise<StoredAccount> {
