@@ -1,6 +1,6 @@
-import type { AuthToken, StoredAccount } from "./accounts.ts"
+import type { AnthropicOauth, AuthToken, StoredAccount } from "./accounts.ts"
 import { loadAccounts, readAuthAnthropic, saveAccounts, upsertAccount, withAuthLock, writeAuthAnthropic } from "./accounts.ts"
-import { CLIENT_ID, INACTIVE_REFRESH_THRESHOLD_MS, OAUTH_BETA, TOKEN_EXPIRY_BUFFER_MS, TOKEN_URL, USAGE_ENDPOINT } from "./constants.ts"
+import { ACTIVE_WAIT_POLL_MS, ACTIVE_WAIT_TIMEOUT_MS, CLIENT_ID, INACTIVE_REFRESH_THRESHOLD_MS, OAUTH_BETA, TOKEN_EXPIRY_BUFFER_MS, TOKEN_URL, USAGE_ENDPOINT } from "./constants.ts"
 import { log, redactBody, redactHeaders } from "./logger.ts"
 import { fetchProfile } from "./profile.ts"
 
@@ -28,6 +28,22 @@ export type AccountUsage = {
   active: boolean
   usage?: UsageResponse
   error?: string
+  pending?: "waiting-refresh" | "refreshing"
+  usageAsOf?: number
+}
+
+export type ActiveTokenOutcome = {
+  access?: string
+  state: "fresh" | "waited" | "self-refreshed" | "waiting-timeout" | "unavailable"
+  authToken?: AuthToken
+}
+
+export type CollectOptions = {
+  // REQUIRED (INV-1): omitting the predicate MUST be a compile error, never a
+  // silent "assume idle" that would let the plugin self-refresh the active chain.
+  // Unknown-state callers pass `() => true` (assume running → never self-refresh).
+  isSessionRunning: () => boolean
+  onPartial?: (results: AccountUsage[]) => void
 }
 
 function errorMessage(error: unknown): string {
@@ -112,14 +128,17 @@ export async function autoCapture(): Promise<void> {
     const auth = await readAuthAnthropic()
     if (!auth?.refresh) return
 
-    let token: AuthToken = { refresh: auth.refresh, access: auth.access, expires: auth.expires }
-    if (isStale(token)) {
-      token = await refreshToken(token.refresh)
-      await writeAuthAnthropic(token)
-    }
+    // auth.json is the SINGLE source of truth for the active chain (INV-2): NEVER
+    // refresh it here — a refresh would consume ex-machina's refresh token and cause
+    // the permanent invalid_grant lockout. Capture only when the stored token is still
+    // valid, and store it AS-IS (no rotation, no writeAuthAnthropic).
+    // Known limitation: a brand-new account whose stored token is already expired is
+    // captured only after its NEXT successful use (which refreshens auth.json); this
+    // round is skipped rather than risk racing/breaking ex-machina's refresh.
+    if (!isActiveFresh(auth)) return
 
-    const profile = await fetchProfile(token.access!)
-    await upsertAccount(profile.uuid, profile.email, token)
+    const profile = await fetchProfile(auth.access)
+    await upsertAccount(profile.uuid, profile.email, { refresh: auth.refresh, access: auth.access, expires: auth.expires })
   })
 }
 
@@ -138,46 +157,218 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-export async function collectAllUsage(): Promise<{ activeId?: string; results: AccountUsage[] }> {
+// INV-5: the active account is FRESH only when auth.json's own access token is not
+// yet expired — a HARD check with NO TOKEN_EXPIRY_BUFFER_MS, matching ex-machina, so
+// we never wait for / trigger a refresh ex-machina itself would not produce.
+function isActiveFresh(auth: AnthropicOauth | undefined): auth is AnthropicOauth & { access: string; expires: number } {
+  return Boolean(auth?.access && auth.expires && auth.expires >= Date.now())
+}
+
+function toAuthToken(auth: AnthropicOauth | undefined): AuthToken | undefined {
+  if (!auth?.refresh) return undefined
+  return { refresh: auth.refresh, access: auth.access, expires: auth.expires }
+}
+
+async function waitForExMachinaRefresh(initial: AnthropicOauth | undefined): Promise<ActiveTokenOutcome> {
+  let last = initial
+  const deadline = Date.now() + ACTIVE_WAIT_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    await sleep(ACTIVE_WAIT_POLL_MS)
+    last = await readAuthAnthropic()
+    if (isActiveFresh(last)) {
+      return { access: last.access, state: "waited", authToken: { refresh: last.refresh!, access: last.access, expires: last.expires } }
+    }
+  }
+  return { state: "waiting-timeout", authToken: toAuthToken(last) }
+}
+
+async function selfRefresh(initial: AnthropicOauth | undefined, isSessionRunning: () => boolean): Promise<ActiveTokenOutcome> {
+  let auth = initial
+  try {
+    auth = await readAuthAnthropic()
+    if (isActiveFresh(auth)) {
+      return { access: auth.access, state: "self-refreshed", authToken: { refresh: auth.refresh!, access: auth.access, expires: auth.expires } }
+    }
+    if (!auth?.refresh) return { state: "unavailable", authToken: toAuthToken(auth) }
+    if (isRefresh429Cooldown(auth.refresh)) return { state: "unavailable", authToken: toAuthToken(auth) }
+    if (isSessionRunning()) return { state: "waiting-timeout", authToken: toAuthToken(auth) }
+    const fresh = await refreshToken(auth.refresh)
+    await writeAuthAnthropic(fresh)
+    return { access: fresh.access, state: "self-refreshed", authToken: fresh }
+  } catch (error) {
+    // H2: the plugin never surfaces its own refresh error — re-read auth.json and
+    // use whatever token is there (ex-machina may have written a fresh one).
+    log.warn("usage:active-self-refresh-fail", { error: errorMessage(error) })
+    const auth2 = await readAuthAnthropic()
+    if (isActiveFresh(auth2)) {
+      return { access: auth2.access, state: "self-refreshed", authToken: { refresh: auth2.refresh!, access: auth2.access, expires: auth2.expires } }
+    }
+    return { state: "unavailable", authToken: toAuthToken(auth2) ?? toAuthToken(auth) }
+  }
+}
+
+// Resolve a usable access token for the ACTIVE account from auth.json ONLY (INV-2),
+// via the three-branch policy: FRESH → use it; EXPIRED+running → wait for ex-machina
+// (ZERO refresh POSTs); EXPIRED+idle → self-refresh once under a single lock and write
+// back. `isSessionRunning` is a REQUIRED param (INV-1): unknown-state callers pass
+// `() => true` so we default to waiting rather than racing ex-machina.
+export async function acquireActiveAccess(isSessionRunning: () => boolean): Promise<ActiveTokenOutcome> {
+  const auth = await readAuthAnthropic()
+  if (isActiveFresh(auth)) {
+    return { access: auth.access, state: "fresh", authToken: { refresh: auth.refresh!, access: auth.access, expires: auth.expires } }
+  }
+  if (isSessionRunning()) return waitForExMachinaRefresh(auth)
+  return withAuthLock(() => selfRefresh(auth, isSessionRunning))
+}
+
+// Last-good active usage, kept module-level so a deferred/unavailable active row can
+// still render recent data (INV-8). Updated on EVERY successful active fetchUsage.
+let lastActiveUsage: { usage: UsageResponse; at: number } | undefined
+
+// A cached window whose reset moment has already passed is no longer "current" — drop
+// it (null) rather than render a stale bar as if it were live (INV-8, G11).
+function pruneUsage(usage: UsageResponse): UsageResponse {
+  const now = Date.now()
+  const keep = (window: UsageWindow | null | undefined): UsageWindow | null =>
+    window && window.resets_at && Date.parse(window.resets_at) < now ? null : (window ?? null)
+  return {
+    five_hour: keep(usage.five_hour),
+    seven_day: keep(usage.seven_day),
+    seven_day_sonnet: keep(usage.seven_day_sonnet),
+    seven_day_opus: keep(usage.seven_day_opus),
+  }
+}
+
+function cachedActiveRow(base: { id: string; label: string; active: boolean }, fallbackError: string): AccountUsage {
+  if (lastActiveUsage) return { ...base, usage: pruneUsage(lastActiveUsage.usage), usageAsOf: lastActiveUsage.at }
+  return { ...base, error: fallbackError }
+}
+
+export async function collectAllUsage(opts: CollectOptions): Promise<{ activeId?: string; results: AccountUsage[] }> {
+  const { isSessionRunning, onPartial } = opts
   const file = await loadAccounts()
+  const auth = await readAuthAnthropic()
 
-  const settled: { result: AccountUsage; updated?: StoredAccount }[] = []
+  const activeRecord = file.activeId ? file.accounts.find((account) => account.id === file.activeId) : undefined
+  const hasActive = Boolean(activeRecord) || Boolean(auth)
+  const activeBase = {
+    id: activeRecord?.id ?? file.activeId ?? "active",
+    label: activeRecord?.label ?? "当前账号",
+    active: true,
+  }
+
+  // INACTIVE accounts (everything that is NOT the auth-held/active one): existing
+  // behavior verbatim — proactive 30-min refresh, writes accounts.json only (INV-3).
+  const inactiveAccounts = file.accounts.filter((account) => account !== activeRecord)
+  const inactiveResults = new Map<string, AccountUsage>()
+  const updated: StoredAccount[] = []
   let needsRefresh = false
-
-  for (const account of file.accounts) {
-    const base = { id: account.id, label: account.label, active: account.id === file.activeId }
-    const bufferMs = account.id === file.activeId ? TOKEN_EXPIRY_BUFFER_MS : INACTIVE_REFRESH_THRESHOLD_MS
+  for (let index = 0; index < inactiveAccounts.length; index++) {
+    const account = inactiveAccounts[index]
+    const base = { id: account.id, label: account.label, active: false }
     try {
-      const { access, updated } = await ensureFresh(account, bufferMs)
-      if (updated) needsRefresh = true
-      if (!access) {
-        settled.push({ result: { ...base, error: "missing access token" }, updated })
-        continue
+      const { access, updated: fresh } = await ensureFresh(account, INACTIVE_REFRESH_THRESHOLD_MS)
+      if (fresh) {
+        needsRefresh = true
+        updated.push(fresh)
       }
-      const usage = await fetchUsage(access)
-      settled.push({ result: { ...base, usage }, updated })
+      if (!access) {
+        inactiveResults.set(account.id, { ...base, error: "missing access token" })
+      } else {
+        const usage = await fetchUsage(access)
+        inactiveResults.set(account.id, { ...base, usage })
+      }
     } catch (error) {
       log.warn("usage:collect-account-fail", { label: account.label, error: errorMessage(error) })
-      settled.push({ result: { ...base, error: errorMessage(error) } })
+      inactiveResults.set(account.id, { ...base, error: errorMessage(error) })
     }
-    if (needsRefresh && file.accounts.indexOf(account) < file.accounts.length - 1) {
+    if (needsRefresh && index < inactiveAccounts.length - 1) {
       await sleep(REFRESH_DELAY_MS)
     }
   }
 
-  const updated = settled.flatMap((entry) => (entry.updated ? [entry.updated] : []))
-  if (updated.length > 0) {
+  // ACTIVE account: auth.json is the SINGLE source of truth (INV-2/4/5). FRESH → fetch
+  // now (real-time); EXPIRED → defer to the resolve phase; no anthropic token → cached
+  // or "未登录". The auth-held chain NEVER enters ensureFresh.
+  let activeAuth: AuthToken | undefined = toAuthToken(auth)
+  let activeFast: AccountUsage | undefined
+  let activeDeferred = false
+  if (hasActive) {
+    if (!auth) {
+      activeFast = cachedActiveRow(activeBase, "未登录")
+    } else if (isActiveFresh(auth)) {
+      try {
+        const usage = await fetchUsage(auth.access)
+        lastActiveUsage = { usage, at: Date.now() }
+        activeFast = { ...activeBase, usage }
+      } catch (error) {
+        log.warn("usage:collect-active-fail", { error: errorMessage(error) })
+        activeFast = { ...activeBase, error: errorMessage(error) }
+      }
+    } else {
+      activeFast = { ...activeBase, pending: isSessionRunning() ? "waiting-refresh" : "refreshing" }
+      activeDeferred = true
+    }
+  }
+
+  const fastResults: AccountUsage[] = []
+  if (activeRecord) {
+    for (const account of file.accounts) {
+      fastResults.push(account === activeRecord ? activeFast! : inactiveResults.get(account.id)!)
+    }
+  } else {
+    if (activeFast) fastResults.push(activeFast)
+    for (const account of file.accounts) fastResults.push(inactiveResults.get(account.id)!)
+  }
+  onPartial?.(fastResults)
+
+  let activeResolved = activeFast
+  if (activeDeferred) {
+    const outcome = await acquireActiveAccess(isSessionRunning)
+    if (outcome.access) {
+      try {
+        const usage = await fetchUsage(outcome.access)
+        lastActiveUsage = { usage, at: Date.now() }
+        activeResolved = { ...activeBase, usage }
+      } catch (error) {
+        log.warn("usage:collect-active-fail", { error: errorMessage(error) })
+        activeResolved = cachedActiveRow(activeBase, errorMessage(error))
+      }
+    } else {
+      activeResolved = cachedActiveRow(activeBase, "额度暂不可用(等待 token 刷新)")
+    }
+    activeAuth = outcome.authToken ?? activeAuth
+  }
+
+  const results = fastResults.map((row) => (row === activeFast ? activeResolved! : row))
+
+  // REVERSE-SYNC (auth.json → accounts.json only) + persist inactive updates, under a
+  // SEPARATE lock from acquireActiveAccess's (INV-6, never nested). The active record's
+  // token is overwritten from activeAuth — a value that always originated in auth.json.
+  const doActiveSync = Boolean(activeRecord && activeAuth?.refresh)
+  if (updated.length > 0 || doActiveSync) {
     await withAuthLock(async () => {
       const current = await loadAccounts()
       for (const account of updated) {
         const index = current.accounts.findIndex((existing) => existing.id === account.id)
         if (index >= 0) current.accounts[index] = { ...current.accounts[index], ...account }
       }
+      if (doActiveSync && activeRecord && activeAuth) {
+        const index = current.accounts.findIndex((existing) => existing.id === activeRecord.id)
+        if (index >= 0) {
+          current.accounts[index] = {
+            ...current.accounts[index],
+            refresh: activeAuth.refresh,
+            access: activeAuth.access,
+            expires: activeAuth.expires,
+          }
+        }
+      }
       await saveAccounts(current)
     })
   }
 
-  return { activeId: file.activeId, results: settled.map((entry) => entry.result) }
+  return { activeId: file.activeId, results }
 }
 
 export async function switchToAccount(id: string): Promise<StoredAccount> {
@@ -185,6 +376,23 @@ export async function switchToAccount(id: string): Promise<StoredAccount> {
     const file = await loadAccounts()
     const index = file.accounts.findIndex((account) => account.id === id)
     if (index < 0) throw new Error("account not found")
+
+    // INV-9 single choke point: reverse-sync the OUTGOING active account's live
+    // auth.json token into its accounts.json record BEFORE switching, so a later switch
+    // BACK to it uses ex-machina's rotated (fresh) refresh, not a stale one (400
+    // invalid_grant). Known residual: this assumes auth.json still belongs to
+    // file.activeId; an out-of-band `opencode auth login` that drifted auth.json before
+    // the next autoCapture realigned activeId could copy a foreign token here — a
+    // documented low-frequency limitation. No fetchProfile identity check (keep switch fast).
+    if (file.activeId && file.activeId !== id) {
+      const outAuth = await readAuthAnthropic()
+      if (outAuth?.refresh) {
+        const outIdx = file.accounts.findIndex((account) => account.id === file.activeId)
+        if (outIdx >= 0) {
+          file.accounts[outIdx] = { ...file.accounts[outIdx], refresh: outAuth.refresh, access: outAuth.access, expires: outAuth.expires }
+        }
+      }
+    }
 
     let account = file.accounts[index]
     if (isStale(account)) {
