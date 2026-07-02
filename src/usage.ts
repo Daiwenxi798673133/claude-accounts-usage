@@ -128,14 +128,17 @@ export async function autoCapture(): Promise<void> {
     const auth = await readAuthAnthropic()
     if (!auth?.refresh) return
 
-    let token: AuthToken = { refresh: auth.refresh, access: auth.access, expires: auth.expires }
-    if (isStale(token)) {
-      token = await refreshToken(token.refresh)
-      await writeAuthAnthropic(token)
-    }
+    // auth.json is the SINGLE source of truth for the active chain (INV-2): NEVER
+    // refresh it here — a refresh would consume ex-machina's refresh token and cause
+    // the permanent invalid_grant lockout. Capture only when the stored token is still
+    // valid, and store it AS-IS (no rotation, no writeAuthAnthropic).
+    // Known limitation: a brand-new account whose stored token is already expired is
+    // captured only after its NEXT successful use (which refreshens auth.json); this
+    // round is skipped rather than risk racing/breaking ex-machina's refresh.
+    if (!isActiveFresh(auth)) return
 
-    const profile = await fetchProfile(token.access!)
-    await upsertAccount(profile.uuid, profile.email, token)
+    const profile = await fetchProfile(auth.access)
+    await upsertAccount(profile.uuid, profile.email, { refresh: auth.refresh, access: auth.access, expires: auth.expires })
   })
 }
 

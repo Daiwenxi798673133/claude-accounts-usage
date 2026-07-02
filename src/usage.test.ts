@@ -60,11 +60,13 @@ mock.module(join(SRC, "constants.ts"), () => ({
 }))
 
 const USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
+const PROFILE_ENDPOINT = "https://api.anthropic.com/api/oauth/profile"
 let refreshMode = "ok"
 let rotated = { access_token: "", refresh_token: "", expires_in: 3600 }
 let usageBody = {}
 let posts = 0
 let usageFetches = 0
+let profileFetches = 0
 globalThis.fetch = (async (input) => {
   const url = String(input)
   if (url === TOKEN_URL) {
@@ -78,12 +80,16 @@ globalThis.fetch = (async (input) => {
     usageFetches++
     return { ok: true, status: 200, json: async () => usageBody }
   }
+  if (url === PROFILE_ENDPOINT) {
+    profileFetches++
+    return { ok: true, status: 200, json: async () => ({ account: { uuid: "u1", email: "a@x.com" } }) }
+  }
   return { ok: true, status: 200, json: async () => ({}) }
 })
 
-const { acquireActiveAccess, collectAllUsage } = await import(join(SRC, "usage.ts"))
+const { acquireActiveAccess, collectAllUsage, autoCapture } = await import(join(SRC, "usage.ts"))
 const active = { id: "acc1", label: "A", refresh: "record-refresh" }
-const reset = (mode) => { posts = 0; usageFetches = 0; refreshMode = mode; rotated = { access_token: "", refresh_token: "", expires_in: 3600 }; usageBody = {} }
+const reset = (mode) => { posts = 0; usageFetches = 0; profileFetches = 0; refreshMode = mode; rotated = { access_token: "", refresh_token: "", expires_in: 3600 }; usageBody = {} }
 const activeRow = (res) => res.results.find((r) => r.active)
 const cap = (row) => ({ error: row?.error, pending: row?.pending, hasUsage: Boolean(row?.usage), usageAsOf: row?.usageAsOf, fiveHour: row?.usage?.five_hour ?? null, sevenDay: row?.usage?.seven_day ?? null })
 const results = {}
@@ -157,6 +163,16 @@ await collectAllUsage({ isSessionRunning: () => false })
 reset("ok"); writeAuth(oauth("stale-k", "auth-refresh-k2", past()))
 { const res = await collectAllUsage({ isSessionRunning: () => true }); const a = activeRow(res); results.ck = { fiveHour: a.usage?.five_hour ?? null, sevenDay: a.usage?.seven_day ?? null, usageAsOf: a.usageAsOf ?? null, posts } }
 
+// ---- autoCapture scenarios (T3): capture only with a valid token, NEVER refresh ----
+reset("ok"); writeAuth(oauth("cap-access", "cap-refresh", future())); writeAccounts({ version: 1, accounts: [] })
+{ await autoCapture(); const accts = readAccounts(); const acc = accts.accounts.find((a) => a.id === "u1"); results.cap_fresh = { posts, profileFetches, activeId: accts.activeId, accId: acc?.id, accLabel: acc?.label, accRefresh: acc?.refresh, accAccess: acc?.access } }
+
+reset("ok"); writeAuth(oauth("expired-cap-access", "expired-cap-refresh", past())); writeAccounts({ version: 1, activeId: "pre", accounts: [{ id: "pre", label: "PRE", refresh: "pre-r", access: "pre-a", expires: future() }] })
+{ const before = JSON.stringify(readAccounts()); const authBefore = JSON.stringify(readAuth()); await autoCapture(); results.cap_expired = { posts, profileFetches, accountsUnchanged: before === JSON.stringify(readAccounts()), authUnchanged: authBefore === JSON.stringify(readAuth()) } }
+
+reset("ok"); writeAuth(undefined); writeAccounts({ version: 1, accounts: [] })
+{ let threw = false; try { await autoCapture() } catch { threw = true } results.cap_noauth = { threw, posts, profileFetches, accountCount: readAccounts().accounts.length } }
+
 writeFileSync(OUT, JSON.stringify(results))
 test("acquireActiveAccess scenarios executed", () => {})
 `
@@ -182,11 +198,25 @@ type CollectRow = {
   partialPending?: string
   finalResolved?: boolean
 }
+type CaptureRow = {
+  posts?: number
+  profileFetches?: number
+  activeId?: string
+  accId?: string
+  accLabel?: string
+  accRefresh?: string
+  accAccess?: string
+  accountsUnchanged?: boolean
+  authUnchanged?: boolean
+  threw?: boolean
+  accountCount?: number
+}
 type Results = {
   a: Outcome; b: Outcome; c: Outcome; d: Outcome; e: Outcome; f: Outcome; g: Outcome
   ch_missing: CollectRow; ch_openai: CollectRow; ca: CollectRow; ce: CollectRow; cd: CollectRow
   cb: CollectRow; cf: CollectRow; cg: CollectRow; cc: CollectRow; h_noactive: CollectRow
   cj: CollectRow; ci: CollectRow; ck: CollectRow
+  cap_fresh: CaptureRow; cap_expired: CaptureRow; cap_noauth: CaptureRow
 }
 
 const runnerDir = mkdtempSync(join(tmpdir(), "cau-parent-"))
@@ -327,4 +357,41 @@ test("collectAllUsage (k) cached window past its resets_at is pruned (not render
   expect(r.ck.sevenDay).not.toBe(null)
   expect(typeof r.ck.usageAsOf).toBe("number")
   expect(r.ck.posts).toBe(0)
+})
+
+test("autoCapture (a) auth FRESH → fetchProfile + upsertAccount store token AS-IS, 0 POSTs to TOKEN_URL", () => {
+  expect(r.cap_fresh.posts).toBe(0)
+  expect(r.cap_fresh.profileFetches).toBe(1)
+  expect(r.cap_fresh.accId).toBe("u1")
+  expect(r.cap_fresh.accLabel).toBe("a@x.com")
+  expect(r.cap_fresh.accRefresh).toBe("cap-refresh")
+  expect(r.cap_fresh.accAccess).toBe("cap-access")
+  expect(r.cap_fresh.activeId).toBe("u1")
+})
+
+test("autoCapture (b) auth EXPIRED → 0 POSTs, no profile fetch, no upsert, auth.json untouched (no writeAuthAnthropic)", () => {
+  expect(r.cap_expired.posts).toBe(0)
+  expect(r.cap_expired.profileFetches).toBe(0)
+  expect(r.cap_expired.accountsUnchanged).toBe(true)
+  expect(r.cap_expired.authUnchanged).toBe(true)
+})
+
+test("autoCapture (malformed) auth.json missing → early return, no crash, nothing written", () => {
+  expect(r.cap_noauth.threw).toBe(false)
+  expect(r.cap_noauth.posts).toBe(0)
+  expect(r.cap_noauth.profileFetches).toBe(0)
+  expect(r.cap_noauth.accountCount).toBe(0)
+})
+
+test("autoCapture (c) body calls only lock-free fns — no refreshToken, no writeAuthAnthropic, single withAuthLock (no nesting)", () => {
+  const src = readFileSync(join(import.meta.dir, "usage.ts"), "utf8")
+  const start = src.indexOf("export async function autoCapture")
+  const raw = src.slice(start, src.indexOf("\nasync function ensureFresh", start))
+  const code = raw
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("//"))
+    .join("\n")
+  expect(code).not.toContain("refreshToken")
+  expect(code).not.toContain("writeAuthAnthropic")
+  expect((code.match(/withAuthLock/g) ?? []).length).toBe(1)
 })
