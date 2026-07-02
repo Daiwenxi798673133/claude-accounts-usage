@@ -378,6 +378,23 @@ export async function switchToAccount(id: string): Promise<StoredAccount> {
     const index = file.accounts.findIndex((account) => account.id === id)
     if (index < 0) throw new Error("account not found")
 
+    // INV-9 single choke point: reverse-sync the OUTGOING active account's live
+    // auth.json token into its accounts.json record BEFORE switching, so a later switch
+    // BACK to it uses ex-machina's rotated (fresh) refresh, not a stale one (400
+    // invalid_grant). Known residual: this assumes auth.json still belongs to
+    // file.activeId; an out-of-band `opencode auth login` that drifted auth.json before
+    // the next autoCapture realigned activeId could copy a foreign token here — a
+    // documented low-frequency limitation. No fetchProfile identity check (keep switch fast).
+    if (file.activeId && file.activeId !== id) {
+      const outAuth = await readAuthAnthropic()
+      if (outAuth?.refresh) {
+        const outIdx = file.accounts.findIndex((account) => account.id === file.activeId)
+        if (outIdx >= 0) {
+          file.accounts[outIdx] = { ...file.accounts[outIdx], refresh: outAuth.refresh, access: outAuth.access, expires: outAuth.expires }
+        }
+      }
+    }
+
     let account = file.accounts[index]
     if (isStale(account)) {
       if (isRefresh429Cooldown(account.refresh)) {

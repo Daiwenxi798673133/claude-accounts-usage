@@ -67,10 +67,12 @@ let usageBody = {}
 let posts = 0
 let usageFetches = 0
 let profileFetches = 0
-globalThis.fetch = (async (input) => {
+let lastRefreshInput
+globalThis.fetch = (async (input, init) => {
   const url = String(input)
   if (url === TOKEN_URL) {
     posts++
+    try { lastRefreshInput = JSON.parse(init?.body ?? "{}").refresh_token } catch {}
     if (refreshMode === "throw-then-fresh") writeAuth(oauth("reread-access", "r-e2", future()))
     if (refreshMode === "429") return { ok: false, status: 429, text: async () => "", headers: { forEach: () => {} } }
     if (refreshMode !== "ok") return { ok: false, status: 500, text: async () => "", headers: { forEach: () => {} } }
@@ -87,9 +89,9 @@ globalThis.fetch = (async (input) => {
   return { ok: true, status: 200, json: async () => ({}) }
 })
 
-const { acquireActiveAccess, collectAllUsage, autoCapture } = await import(join(SRC, "usage.ts"))
+const { acquireActiveAccess, collectAllUsage, autoCapture, switchToAccount } = await import(join(SRC, "usage.ts"))
 const active = { id: "acc1", label: "A", refresh: "record-refresh" }
-const reset = (mode) => { posts = 0; usageFetches = 0; profileFetches = 0; refreshMode = mode; rotated = { access_token: "", refresh_token: "", expires_in: 3600 }; usageBody = {} }
+const reset = (mode) => { posts = 0; usageFetches = 0; profileFetches = 0; refreshMode = mode; rotated = { access_token: "", refresh_token: "", expires_in: 3600 }; usageBody = {}; lastRefreshInput = undefined }
 const activeRow = (res) => res.results.find((r) => r.active)
 const cap = (row) => ({ error: row?.error, pending: row?.pending, hasUsage: Boolean(row?.usage), usageAsOf: row?.usageAsOf, fiveHour: row?.usage?.five_hour ?? null, sevenDay: row?.usage?.seven_day ?? null })
 const results = {}
@@ -173,6 +175,41 @@ reset("ok"); writeAuth(oauth("expired-cap-access", "expired-cap-refresh", past()
 reset("ok"); writeAuth(undefined); writeAccounts({ version: 1, accounts: [] })
 { let threw = false; try { await autoCapture() } catch { threw = true } results.cap_noauth = { threw, posts, profileFetches, accountCount: readAccounts().accounts.length } }
 
+// ---- switchToAccount scenarios (T4): reverse-sync OUTGOING active token before switching ----
+const acctsAB = (a, b, activeId) => ({ version: 1, activeId, accounts: [a, b] })
+
+// (a)/(b)/(c): auth.json holds a ROTATED token for OUTGOING active A; switch A→B (B fresh).
+reset("ok")
+writeAuth(oauth("A-rotated-access", "A-rotated-refresh", future()))
+writeAccounts(acctsAB(
+  { id: "acc1", label: "A", refresh: "A-stored-old", access: "A-stored-old-a", expires: future() },
+  { id: "acc2", label: "B", refresh: "B-refresh", access: "B-access", expires: future() },
+  "acc1",
+))
+{ const ret = await switchToAccount("acc2"); const accs = readAccounts(); const a = accs.accounts.find((x) => x.id === "acc1"); const authNow = readAuth(); results.sw_reverse = { posts, activeId: accs.activeId, retId: ret.id, aRefresh: a.refresh, aAccess: a.access, authRefresh: authNow.refresh, authAccess: authNow.access } }
+
+// (a) malformed: auth.json missing → no crash, skip reverse-sync; outgoing record kept, target still written.
+reset("ok"); writeAuth(undefined)
+writeAccounts(acctsAB(
+  { id: "acc1", label: "A", refresh: "A-keep", access: "A-keep-a", expires: future() },
+  { id: "acc2", label: "B", refresh: "B-keep", access: "B-keep-a", expires: future() },
+  "acc1",
+))
+{ let threw = false; try { await switchToAccount("acc2") } catch { threw = true } const accs = readAccounts(); const a = accs.accounts.find((x) => x.id === "acc1"); const authNow = readAuth(); results.sw_noauth = { threw, posts, aRefresh: a.refresh, activeId: accs.activeId, authRefresh: authNow.refresh } }
+
+// (d) REGRESSION round-trip: A active + auth.json rotated A live; A→B then B→A → back path uses LIVE token, not dead.
+reset("ok")
+rotated = { access_token: "should-not-be-used", refresh_token: "should-not-be-used", expires_in: 3600 }
+writeAuth(oauth("A-live-access", "A-live-refresh", future()))
+writeAccounts(acctsAB(
+  { id: "acc1", label: "A", refresh: "A-dead-refresh", access: "A-dead-access", expires: past() },
+  { id: "acc2", label: "B", refresh: "B-refresh2", access: "B-access2", expires: future() },
+  "acc1",
+))
+await switchToAccount("acc2")
+await switchToAccount("acc1")
+{ const accs = readAccounts(); const a = accs.accounts.find((x) => x.id === "acc1"); const authNow = readAuth(); results.sw_roundtrip = { posts, lastRefreshInput: lastRefreshInput ?? null, aRefresh: a.refresh, authRefresh: authNow.refresh, authAccess: authNow.access } }
+
 writeFileSync(OUT, JSON.stringify(results))
 test("acquireActiveAccess scenarios executed", () => {})
 `
@@ -211,12 +248,24 @@ type CaptureRow = {
   threw?: boolean
   accountCount?: number
 }
+type SwitchRow = {
+  posts?: number
+  activeId?: string
+  retId?: string
+  aRefresh?: string
+  aAccess?: string
+  authRefresh?: string
+  authAccess?: string
+  threw?: boolean
+  lastRefreshInput?: string | null
+}
 type Results = {
   a: Outcome; b: Outcome; c: Outcome; d: Outcome; e: Outcome; f: Outcome; g: Outcome
   ch_missing: CollectRow; ch_openai: CollectRow; ca: CollectRow; ce: CollectRow; cd: CollectRow
   cb: CollectRow; cf: CollectRow; cg: CollectRow; cc: CollectRow; h_noactive: CollectRow
   cj: CollectRow; ci: CollectRow; ck: CollectRow
   cap_fresh: CaptureRow; cap_expired: CaptureRow; cap_noauth: CaptureRow
+  sw_reverse: SwitchRow; sw_noauth: SwitchRow; sw_roundtrip: SwitchRow
 }
 
 const runnerDir = mkdtempSync(join(tmpdir(), "cau-parent-"))
@@ -394,4 +443,36 @@ test("autoCapture (c) body calls only lock-free fns — no refreshToken, no writ
   expect(code).not.toContain("refreshToken")
   expect(code).not.toContain("writeAuthAnthropic")
   expect((code.match(/withAuthLock/g) ?? []).length).toBe(1)
+})
+
+test("switchToAccount (a) A→B reverse-syncs OUTGOING A's accounts.json record to auth.json's CURRENT (rotated) A token BEFORE switching", () => {
+  expect(r.sw_reverse.aRefresh).toBe("A-rotated-refresh")
+  expect(r.sw_reverse.aAccess).toBe("A-rotated-access")
+  expect(r.sw_reverse.activeId).toBe("acc2")
+  expect(r.sw_reverse.retId).toBe("acc2")
+})
+
+test("switchToAccount (b) target B is written to auth.json", () => {
+  expect(r.sw_reverse.authRefresh).toBe("B-refresh")
+  expect(r.sw_reverse.authAccess).toBe("B-access")
+})
+
+test("switchToAccount (c) target B fresh → NOT re-refreshed (0 POSTs for the B path)", () => {
+  expect(r.sw_reverse.posts).toBe(0)
+})
+
+test("switchToAccount (malformed) auth.json missing → no crash, skip reverse-sync, outgoing record kept, target still switched", () => {
+  expect(r.sw_noauth.threw).toBe(false)
+  expect(r.sw_noauth.posts).toBe(0)
+  expect(r.sw_noauth.aRefresh).toBe("A-keep")
+  expect(r.sw_noauth.activeId).toBe("acc2")
+  expect(r.sw_noauth.authRefresh).toBe("B-keep")
+})
+
+test("switchToAccount (d) REGRESSION round-trip A→B→A uses the LIVE (rotated) A token, never the pre-rotation dead one — no stale switch-back", () => {
+  expect(r.sw_roundtrip.posts).toBe(0)
+  expect(r.sw_roundtrip.lastRefreshInput).toBe(null)
+  expect(r.sw_roundtrip.aRefresh).toBe("A-live-refresh")
+  expect(r.sw_roundtrip.authRefresh).toBe("A-live-refresh")
+  expect(r.sw_roundtrip.authAccess).toBe("A-live-access")
 })
