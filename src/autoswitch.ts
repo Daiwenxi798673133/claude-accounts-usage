@@ -28,6 +28,7 @@ type RetryErrorLike = {
 export type AutoSwitchController = {
   dispose: () => void
   setUsageCache: (results: AccountUsage[]) => void
+  isSessionRunning: () => boolean
 }
 
 function lowerKeys(headers?: Record<string, string>): Record<string, string> {
@@ -122,6 +123,12 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   const lastAction = new Map<string, number>()
   const lastHandledAssistantId = new Map<string, string>()
   const seen = new Set<string>()
+  // Running-session tracking (INV-1). A session is "running" while its status is busy OR retry;
+  // it leaves the set only on a positively-confirmed idle (session.idle / session.error / status idle).
+  const runningSessions = new Set<string>()
+  // Every anthropic session ever observed, so isSessionRunning can distinguish "confirmed idle"
+  // (all known sessions poll idle) from "unknown" (nothing observed yet ⇒ treat as running).
+  const knownAnthropicSessions = new Set<string>()
   let usageCache: { at: number; byId: Map<string, UsageResponse> } = { at: 0, byId: new Map() }
   let refreshing = false
   let lastSwitch: { id?: string; sessionID?: string; at: number } = { at: 0 }
@@ -285,11 +292,24 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     }
   }
 
+  // INV-1: returns true when a session is running OR the running-state is UNKNOWN; false ONLY on a
+  // positively-confirmed idle. An empty knownAnthropicSessions set (nothing observed yet) reads as
+  // running, never idle — so the active-token self-refresh never fires while a turn might be live.
+  function isSessionRunning(): boolean {
+    if (runningSessions.size > 0) return true
+    if (knownAnthropicSessions.size === 0) return true
+    for (const sid of knownAnthropicSessions) {
+      const status = api.state.session.status(sid)
+      if (status && status.type !== "idle") return true
+    }
+    return false
+  }
+
   async function refreshUsageInBackground(): Promise<void> {
     if (refreshing) return
     refreshing = true
     try {
-      const { results } = await collectAllUsage({ isSessionRunning: () => true })
+      const { results } = await collectAllUsage({ isSessionRunning })
       setUsageCache(results)
     } catch {
       // best-effort cache warming; selection falls back to round-robin
@@ -540,6 +560,12 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       type: status?.type,
       message: status?.type === "retry" ? status.message : undefined,
     })
+    const sid = event.properties.sessionID
+    if (isAnthropicSession(sid)) {
+      knownAnthropicSessions.add(sid)
+      if (status?.type === "idle") runningSessions.delete(sid)
+      else if (status?.type) runningSessions.add(sid)
+    }
     if (status?.type !== "retry" || !ENABLED || !dedup(event.id)) return
     const error: RetryErrorLike = { message: status.message }
     const matched = isUsageLimit(error)
@@ -559,6 +585,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       headerKeys: redactHeaders(error?.responseHeaders),
       body: redactBody(error?.responseBody),
     })
+    if (sessionID) runningSessions.delete(sessionID)
     if (!ENABLED || !dedup(event.id) || !sessionID) return
     const matched = !!error && isUsageLimit(error)
     const anthropic = isAnthropicSession(sessionID)
@@ -568,6 +595,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   }
 
   async function onIdle(sessionID: string): Promise<void> {
+    runningSessions.delete(sessionID)
     const assistant = lastAssistant(sessionID)
     if (assistant && !assistant.error) {
       const activeId = await readActiveId()
@@ -618,5 +646,6 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       persistCooldown()
     },
     setUsageCache,
+    isSessionRunning,
   }
 }
