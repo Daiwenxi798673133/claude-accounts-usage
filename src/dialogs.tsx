@@ -84,7 +84,7 @@ function AccountRow(props: {
         <text fg={props.selected ? theme().primary : theme().textMuted}>{props.selected ? "▶" : " "}</text>
         <text fg={props.selected ? theme().primary : theme().text}>
           {isActive() ? "●" : "○"} {props.account.label}
-          {isActive() ? " (当前)" : ""}
+          {isActive() ? " In Use" : ""}
         </text>
         <Show when={props.account.excluded}>
           <text fg={theme().textMuted}>不自动切</text>
@@ -106,7 +106,16 @@ function AccountRow(props: {
             </box>
           )}
         </Show>
-        <Show when={props.loading && !props.usage?.usage && !props.usage?.error}>
+        <Show when={props.usage?.usage && props.usage?.usageAsOf}>
+          <text fg={theme().textMuted}>截至 {clockTime(props.usage!.usageAsOf!)}</text>
+        </Show>
+        <Show when={props.usage?.pending === "waiting-refresh"}>
+          <text fg={theme().textMuted}>等待 token 刷新…</text>
+        </Show>
+        <Show when={props.usage?.pending === "refreshing"}>
+          <text fg={theme().textMuted}>刷新中…</text>
+        </Show>
+        <Show when={props.loading && !props.usage?.usage && !props.usage?.error && !props.usage?.pending}>
           <text fg={theme().textMuted}>加载中…</text>
         </Show>
       </box>
