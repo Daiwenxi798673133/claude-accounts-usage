@@ -1,6 +1,6 @@
-import type { AuthToken, StoredAccount } from "./accounts.ts"
+import type { AnthropicOauth, AuthToken, StoredAccount } from "./accounts.ts"
 import { loadAccounts, readAuthAnthropic, saveAccounts, upsertAccount, withAuthLock, writeAuthAnthropic } from "./accounts.ts"
-import { CLIENT_ID, INACTIVE_REFRESH_THRESHOLD_MS, OAUTH_BETA, TOKEN_EXPIRY_BUFFER_MS, TOKEN_URL, USAGE_ENDPOINT } from "./constants.ts"
+import { ACTIVE_WAIT_POLL_MS, ACTIVE_WAIT_TIMEOUT_MS, CLIENT_ID, INACTIVE_REFRESH_THRESHOLD_MS, OAUTH_BETA, TOKEN_EXPIRY_BUFFER_MS, TOKEN_URL, USAGE_ENDPOINT } from "./constants.ts"
 import { log, redactBody, redactHeaders } from "./logger.ts"
 import { fetchProfile } from "./profile.ts"
 
@@ -28,6 +28,19 @@ export type AccountUsage = {
   active: boolean
   usage?: UsageResponse
   error?: string
+  pending?: "waiting-refresh" | "refreshing"
+  usageAsOf?: number
+}
+
+export type ActiveTokenOutcome = {
+  access?: string
+  state: "fresh" | "waited" | "self-refreshed" | "waiting-timeout" | "unavailable"
+  authToken?: AuthToken
+}
+
+export type CollectOptions = {
+  isSessionRunning?: () => boolean
+  onPartial?: (results: AccountUsage[]) => void
 }
 
 function errorMessage(error: unknown): string {
@@ -136,6 +149,70 @@ async function ensureFresh(account: StoredAccount, bufferMs?: number): Promise<{
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// INV-5: the active account is FRESH only when auth.json's own access token is not
+// yet expired — a HARD check with NO TOKEN_EXPIRY_BUFFER_MS, matching ex-machina, so
+// we never wait for / trigger a refresh ex-machina itself would not produce.
+function isActiveFresh(auth: AnthropicOauth | undefined): auth is AnthropicOauth & { access: string; expires: number } {
+  return Boolean(auth?.access && auth.expires && auth.expires >= Date.now())
+}
+
+function toAuthToken(auth: AnthropicOauth | undefined): AuthToken | undefined {
+  if (!auth?.refresh) return undefined
+  return { refresh: auth.refresh, access: auth.access, expires: auth.expires }
+}
+
+async function waitForExMachinaRefresh(initial: AnthropicOauth | undefined): Promise<ActiveTokenOutcome> {
+  let last = initial
+  const deadline = Date.now() + ACTIVE_WAIT_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    await sleep(ACTIVE_WAIT_POLL_MS)
+    last = await readAuthAnthropic()
+    if (isActiveFresh(last)) {
+      return { access: last.access, state: "waited", authToken: { refresh: last.refresh!, access: last.access, expires: last.expires } }
+    }
+  }
+  return { state: "waiting-timeout", authToken: toAuthToken(last) }
+}
+
+async function selfRefresh(initial: AnthropicOauth | undefined, isSessionRunning: () => boolean): Promise<ActiveTokenOutcome> {
+  let auth = initial
+  try {
+    auth = await readAuthAnthropic()
+    if (isActiveFresh(auth)) {
+      return { access: auth.access, state: "self-refreshed", authToken: { refresh: auth.refresh!, access: auth.access, expires: auth.expires } }
+    }
+    if (!auth?.refresh) return { state: "unavailable", authToken: toAuthToken(auth) }
+    if (isRefresh429Cooldown(auth.refresh)) return { state: "unavailable", authToken: toAuthToken(auth) }
+    if (isSessionRunning()) return { state: "waiting-timeout", authToken: toAuthToken(auth) }
+    const fresh = await refreshToken(auth.refresh)
+    await writeAuthAnthropic(fresh)
+    return { access: fresh.access, state: "self-refreshed", authToken: fresh }
+  } catch (error) {
+    // H2: the plugin never surfaces its own refresh error — re-read auth.json and
+    // use whatever token is there (ex-machina may have written a fresh one).
+    log.warn("usage:active-self-refresh-fail", { error: errorMessage(error) })
+    const auth2 = await readAuthAnthropic()
+    if (isActiveFresh(auth2)) {
+      return { access: auth2.access, state: "self-refreshed", authToken: { refresh: auth2.refresh!, access: auth2.access, expires: auth2.expires } }
+    }
+    return { state: "unavailable", authToken: toAuthToken(auth2) ?? toAuthToken(auth) }
+  }
+}
+
+// Resolve a usable access token for the ACTIVE account from auth.json ONLY (INV-2),
+// via the three-branch policy: FRESH → use it; EXPIRED+running → wait for ex-machina
+// (ZERO refresh POSTs); EXPIRED+idle → self-refresh once under a single lock and write
+// back. `isSessionRunning` is a REQUIRED param (INV-1): unknown-state callers pass
+// `() => true` so we default to waiting rather than racing ex-machina.
+export async function acquireActiveAccess(active: StoredAccount, isSessionRunning: () => boolean): Promise<ActiveTokenOutcome> {
+  const auth = await readAuthAnthropic()
+  if (isActiveFresh(auth)) {
+    return { access: auth.access, state: "fresh", authToken: { refresh: auth.refresh!, access: auth.access, expires: auth.expires } }
+  }
+  if (isSessionRunning()) return waitForExMachinaRefresh(auth)
+  return withAuthLock(() => selfRefresh(auth, isSessionRunning))
 }
 
 export async function collectAllUsage(): Promise<{ activeId?: string; results: AccountUsage[] }> {
