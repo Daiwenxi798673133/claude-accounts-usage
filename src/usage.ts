@@ -212,7 +212,7 @@ async function selfRefresh(initial: AnthropicOauth | undefined, isSessionRunning
 // (ZERO refresh POSTs); EXPIRED+idle → self-refresh once under a single lock and write
 // back. `isSessionRunning` is a REQUIRED param (INV-1): unknown-state callers pass
 // `() => true` so we default to waiting rather than racing ex-machina.
-export async function acquireActiveAccess(active: StoredAccount, isSessionRunning: () => boolean): Promise<ActiveTokenOutcome> {
+export async function acquireActiveAccess(isSessionRunning: () => boolean): Promise<ActiveTokenOutcome> {
   const auth = await readAuthAnthropic()
   if (isActiveFresh(auth)) {
     return { access: auth.access, state: "fresh", authToken: { refresh: auth.refresh!, access: auth.access, expires: auth.expires } }
@@ -324,8 +324,7 @@ export async function collectAllUsage(opts: CollectOptions): Promise<{ activeId?
 
   let activeResolved = activeFast
   if (activeDeferred) {
-    const activeStored: StoredAccount = activeRecord ?? { id: activeBase.id, label: activeBase.label, refresh: auth?.refresh ?? "" }
-    const outcome = await acquireActiveAccess(activeStored, isSessionRunning)
+    const outcome = await acquireActiveAccess(isSessionRunning)
     if (outcome.access) {
       try {
         const usage = await fetchUsage(outcome.access)

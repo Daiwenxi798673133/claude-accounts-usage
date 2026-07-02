@@ -90,33 +90,32 @@ globalThis.fetch = (async (input, init) => {
 })
 
 const { acquireActiveAccess, collectAllUsage, autoCapture, switchToAccount } = await import(join(SRC, "usage.ts"))
-const active = { id: "acc1", label: "A", refresh: "record-refresh" }
 const reset = (mode) => { posts = 0; usageFetches = 0; profileFetches = 0; refreshMode = mode; rotated = { access_token: "", refresh_token: "", expires_in: 3600 }; usageBody = {}; lastRefreshInput = undefined }
 const activeRow = (res) => res.results.find((r) => r.active)
 const cap = (row) => ({ error: row?.error, pending: row?.pending, hasUsage: Boolean(row?.usage), usageAsOf: row?.usageAsOf, fiveHour: row?.usage?.five_hour ?? null, sevenDay: row?.usage?.seven_day ?? null })
 const results = {}
 
 reset("ok"); writeAuth(oauth("fresh-access", "r-a", future()))
-{ const o = await acquireActiveAccess(active, () => true); results.a = { state: o.state, access: o.access, refresh: o.authToken?.refresh, tokenAccess: o.authToken?.access, posts } }
+{ const o = await acquireActiveAccess(() => true); results.a = { state: o.state, access: o.access, refresh: o.authToken?.refresh, tokenAccess: o.authToken?.access, posts } }
 
 reset("ok"); writeAuth(oauth("stale-access", "r-b", past()))
 setTimeout(() => writeAuth(oauth("waited-access", "r-b", future())), 12)
-{ const o = await acquireActiveAccess(active, () => true); results.b = { state: o.state, access: o.access, posts } }
+{ const o = await acquireActiveAccess(() => true); results.b = { state: o.state, access: o.access, posts } }
 
 reset("ok"); writeAuth(oauth("stale-access", "r-c", past()))
-{ const o = await acquireActiveAccess(active, () => true); results.c = { state: o.state, refresh: o.authToken?.refresh, posts } }
+{ const o = await acquireActiveAccess(() => true); results.c = { state: o.state, refresh: o.authToken?.refresh, posts } }
 
 reset("ok"); rotated = { access_token: "rotated-access", refresh_token: "rotated-refresh", expires_in: 3600 }; writeAuth(oauth("stale-access", "r-d", past()))
-{ const o = await acquireActiveAccess(active, () => false); const w = readAuth(); results.d = { state: o.state, access: o.access, posts, wRefresh: w?.refresh, wAccess: w?.access } }
+{ const o = await acquireActiveAccess(() => false); const w = readAuth(); results.d = { state: o.state, access: o.access, posts, wRefresh: w?.refresh, wAccess: w?.access } }
 
 reset("throw-then-fresh"); writeAuth(oauth("stale-access", "r-e", past()))
-{ const o = await acquireActiveAccess(active, () => false); results.e = { state: o.state, access: o.access, refresh: o.authToken?.refresh } }
+{ const o = await acquireActiveAccess(() => false); results.e = { state: o.state, access: o.access, refresh: o.authToken?.refresh } }
 
 reset("throw"); writeAuth(oauth("stale-access", "r-f", past()))
-{ const o = await acquireActiveAccess(active, () => false); results.f = { state: o.state, access: o.access, refresh: o.authToken?.refresh } }
+{ const o = await acquireActiveAccess(() => false); results.f = { state: o.state, access: o.access, refresh: o.authToken?.refresh } }
 
 reset("ok"); writeAuth(undefined)
-{ const o = await acquireActiveAccess(active, () => false); results.g = { state: o.state, posts } }
+{ const o = await acquireActiveAccess(() => false); results.g = { state: o.state, posts } }
 
 // ---- collectAllUsage scenarios (lastActiveUsage starts empty here) ----
 const acctsActive = (rec) => ({ version: 1, activeId: "acc1", accounts: [rec] })
