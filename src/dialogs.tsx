@@ -95,7 +95,7 @@ function AccountRow(props: {
       </box>
       <box flexDirection="column" paddingLeft={4}>
         <Show when={props.usage?.error}>
-          <text fg={theme().error}>{props.usage!.error}</text>
+          <text fg={theme().error}>{props.usage?.error}</text>
         </Show>
         <Show when={props.usage?.usage}>
           {(usage) => (
@@ -107,7 +107,7 @@ function AccountRow(props: {
           )}
         </Show>
         <Show when={props.usage?.usage && props.usage?.usageAsOf}>
-          <text fg={theme().textMuted}>截至 {clockTime(props.usage!.usageAsOf!)}</text>
+          <text fg={theme().textMuted}>截至 {clockTime(props.usage?.usageAsOf ?? 0)}</text>
         </Show>
         <Show when={props.usage?.pending === "waiting-refresh"}>
           <text fg={theme().textMuted}>等待 token 刷新…</text>
