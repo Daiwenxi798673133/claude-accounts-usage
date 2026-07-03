@@ -20,3 +20,10 @@ export const TOKEN_EXPIRY_BUFFER_MS = 60_000
 // (and is ready for auto-switch). Never applied to the active account — ex-machina
 // owns and rotates that one, so racing it would cause invalid_grant.
 export const INACTIVE_REFRESH_THRESHOLD_MS = 30 * 60_000
+
+// Active account is expired + an anthropic session is running: instead of racing
+// ex-machina to refresh, poll auth.json every ACTIVE_WAIT_POLL_MS until ex-machina
+// writes a fresh token, giving up after ACTIVE_WAIT_TIMEOUT_MS (then show cached).
+// Mirrors autoswitch IDLE_WAIT_TIMEOUT_MS/IDLE_POLL_MS.
+export const ACTIVE_WAIT_TIMEOUT_MS = 8_000
+export const ACTIVE_WAIT_POLL_MS = 200
