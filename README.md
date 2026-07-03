@@ -66,13 +66,13 @@ TUI 插件只在 `~/.config/opencode/tui.json` 配置,**不要**放进 `opencode
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["claude-accounts-usage@0.2.1"]
+  "plugin": ["claude-accounts-usage@0.2.2"]
 }
 ```
 
 OpenCode 会自动解析并安装该包,无需手动 `npm install`。
 
-> `0.2.1` 是当前**最新稳定版**(含 `/stats` 仪表盘、自动切号数据丢失修复,以及当前账号 token 刷新竞态修复——根治那个会导致需重新登录的 `invalid_grant` 故障)。
+> `0.2.2` 是当前**最新稳定版**(在 0.2.1 基础上修复了某些账号状态下打开 `/usage` 会崩溃的问题;此前含 `/stats` 仪表盘、自动切号数据丢失修复,以及当前账号 token 刷新竞态修复——根治那个会导致需重新登录的 `invalid_grant` 故障)。
 >
 > **建议带上版本号**。OpenCode 按"含版本号的包名"建独立缓存目录:写死版本号后,以后升级只需把后缀改成新版本号;若不带版本号,会被首次安装的版本锁住,发布新版也不会自动更新。
 
