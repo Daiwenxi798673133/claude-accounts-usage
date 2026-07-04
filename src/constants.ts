@@ -15,10 +15,10 @@ export const OAUTH_BETA = "oauth-2025-04-20"
 // receives an already-stale access token.
 export const TOKEN_EXPIRY_BUFFER_MS = 60_000
 
-// When /usage runs, proactively refresh INACTIVE accounts whose access token
-// expires within this window, so an idle account stays fresh between /usage opens
-// (and is ready for auto-switch). Never applied to the active account — ex-machina
-// owns and rotates that one, so racing it would cause invalid_grant.
+// Proactively refresh accounts whose access token expires within this window: INACTIVE
+// accounts on every /usage + keeper tick, and the ACTIVE chain only while idle (no
+// anthropic session running) — ex-machina refreshes only at request time, so an idle
+// refresh cannot race it.
 export const INACTIVE_REFRESH_THRESHOLD_MS = 30 * 60_000
 
 // Active account is expired + an anthropic session is running: instead of racing
@@ -27,3 +27,15 @@ export const INACTIVE_REFRESH_THRESHOLD_MS = 30 * 60_000
 // Mirrors autoswitch IDLE_WAIT_TIMEOUT_MS/IDLE_POLL_MS.
 export const ACTIVE_WAIT_TIMEOUT_MS = 8_000
 export const ACTIVE_WAIT_POLL_MS = 200
+
+// Hard ceiling on any Anthropic network call. Several of these (token refresh, profile
+// capture) run while holding the auth lock, so an un-bounded hang would starve every
+// account switch / usage collect queued behind it — the timeout bounds that blast radius.
+export const NETWORK_TIMEOUT_MS = 15_000
+
+// Token keeper: background keep-alive pass over INACTIVE accounts every tick (refresh
+// only those inside INACTIVE_REFRESH_THRESHOLD_MS of expiry), plus an auth.json watcher
+// that re-captures the active chain tip on every ex-machina rotation so the tip is never
+// lost across an out-of-band switch (`opencode auth login`, restart).
+export const KEEPALIVE_TICK_MS = 5 * 60_000
+export const WATCH_DEBOUNCE_MS = 500

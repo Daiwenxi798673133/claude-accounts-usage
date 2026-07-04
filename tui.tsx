@@ -1,8 +1,9 @@
 import { createSignal } from "solid-js"
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { loadAccounts, removeAccount, setAccountExcluded } from "./src/accounts.ts"
-import { autoCapture, collectAllUsage, switchToAccount } from "./src/usage.ts"
+import { autoCapture, collectAllUsage, retryFlaggedRefresh, switchToAccount } from "./src/usage.ts"
 import { installAutoSwitch } from "./src/autoswitch.ts"
+import { installTokenKeeper } from "./src/keeper.ts"
 import { initLogger, log } from "./src/logger.ts"
 import { openUsageDialog, type UsageState } from "./src/dialogs.tsx"
 import { aggregate, loadRows, type RawRow, type TimeRange } from "./src/stats.ts"
@@ -21,6 +22,9 @@ const tui: TuiPlugin = async (api) => {
 
   const autoSwitch = installAutoSwitch(api)
   api.lifecycle.onDispose(autoSwitch.dispose)
+
+  const keeper = installTokenKeeper(autoSwitch.isSessionRunning)
+  api.lifecycle.onDispose(keeper.dispose)
 
   let statsRows: RawRow[] | undefined
   let statsSeq = 0
@@ -93,6 +97,18 @@ const tui: TuiPlugin = async (api) => {
           state,
           async (id) => {
             try {
+              const current = await loadAccounts()
+              const target = current.accounts.find((account) => account.id === id)
+              if (target?.needsReauth) {
+                try {
+                  await retryFlaggedRefresh(id)
+                  log.info("tui:retry-reauth-ok", { id })
+                } catch (error) {
+                  log.warn("tui:retry-reauth-fail", { id, error: message(error) })
+                  api.ui.toast({ variant: "error", message: `该账号需重新登录,请用 ex-machina 重新登录后再切换` })
+                  return
+                }
+              }
               const account = await switchToAccount(id)
               log.info("tui:switch-ok", { id })
               api.ui.toast({ variant: "success", message: `已切换到 ${account.label},下次对话生效` })

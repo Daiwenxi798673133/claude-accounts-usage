@@ -437,6 +437,50 @@ test("标记号不参与自动切号:撞限切到未标记号(acc3),跳过 exclu
   }
 })
 
+test("needsReauth 号不参与自动切号:撞限切到健康号(acc3),跳过 needsReauth 的 acc2", async () => {
+  switchCalls.length = 0
+  accountsOverride = {
+    accounts: [
+      { id: "acc1", label: "A" },
+      { id: "acc2", label: "B", needsReauth: true },
+      { id: "acc3", label: "C" },
+    ],
+    activeId: "acc1",
+  }
+  try {
+    const { handlers, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    fireRetry(handlers, "evt-skip-reauth")
+    await flush(() => switchCalls.length > 0)
+
+    expect(switchCalls).toContain("acc3")
+    expect(switchCalls).not.toContain("acc2")
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
+test("仅剩 needsReauth 号:撞限 → standDown(不切到 needsReauth 号、零 switch)", async () => {
+  switchCalls.length = 0
+  accountsOverride = {
+    accounts: [
+      { id: "acc1", label: "A" },
+      { id: "acc2", label: "B", needsReauth: true },
+    ],
+    activeId: "acc1",
+  }
+  try {
+    const { handlers, toasts, controller } = setup([{ type: "tool", tool: "read", state: { status: "completed" } }])
+    fireRetry(handlers, "evt-all-reauth")
+    await flush(() => toasts.some((t) => t.variant === "error"))
+
+    expect(switchCalls.length).toBe(0)
+    controller.dispose()
+  } finally {
+    accountsOverride = undefined
+  }
+})
+
 test("仅剩标记号:撞限 → standDown(不切到标记号、零 promptAsync、出现额度上限 toast)", async () => {
   switchCalls.length = 0
   accountsOverride = {

@@ -363,7 +363,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   function pickNext(file: AccountsFile, tried: Set<string>, activeId?: string): StoredAccount | undefined {
     const now = Date.now()
     const candidates = file.accounts.filter(
-      (account) => account.id !== activeId && !tried.has(account.id) && !isCooled(account.id, now) && !account.excluded,
+      (account) => account.id !== activeId && !tried.has(account.id) && !isCooled(account.id, now) && !account.excluded && !account.needsReauth,
     )
     if (candidates.length === 0) {
       log.debug("autoswitch:pick", { candidates: 0, cacheFresh: false, picked: undefined })

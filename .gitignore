@@ -10,6 +10,7 @@ bun.lock
 .opencode/
 .sisyphus/
 .omo/
+.codegraph/
 
 # 本地密钥文件（npm token 等），勿提交
 vars.txt
