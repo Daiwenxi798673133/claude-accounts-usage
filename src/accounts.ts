@@ -10,6 +10,7 @@ export type StoredAccount = {
   access?: string
   expires?: number
   excluded?: boolean
+  needsReauth?: boolean
 }
 
 export type AccountsFile = {
@@ -31,6 +32,18 @@ export type AuthToken = {
   expires?: number
 }
 
+// SINGLE token-write path for a StoredAccount. Every site that stamps a fresh token
+// onto a record MUST go through here so the dead-token flag is cleared atomically with
+// the write — a spread-merge would silently keep needsReauth and strand a re-logged-in
+// account as permanently skipped.
+export function applyToken(record: StoredAccount, token: AuthToken): StoredAccount {
+  record.refresh = token.refresh
+  record.access = token.access
+  record.expires = token.expires
+  delete record.needsReauth
+  return record
+}
+
 const ACCOUNTS_PATH = join(homedir(), ".config", "opencode", "claude-accounts.json")
 
 function authJsonCandidates(): string[] {
@@ -49,7 +62,7 @@ async function readJson<T>(path: string): Promise<T | undefined> {
   }
 }
 
-async function atomicWriteJson(path: string, data: unknown): Promise<void> {
+export async function atomicWriteJson(path: string, data: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
   const tmp = `${path}.tmp-${process.pid}-${Date.now()}`
   await writeFile(tmp, JSON.stringify(data, null, 2), { mode: 0o600 })
@@ -62,6 +75,10 @@ async function resolveAuthJsonPath(): Promise<string> {
     if (await readJson(candidate)) return candidate
   }
   return candidates[0]
+}
+
+export function getAuthJsonPath(): Promise<string> {
+  return resolveAuthJsonPath()
 }
 
 // Serializes auth.json / claude-accounts.json read-modify-writes. NOT reentrant:
@@ -123,12 +140,7 @@ export async function upsertAccount(id: string, label: string, token: AuthToken)
   const index = file.accounts.findIndex((account) => account.id === id)
   const inserted = index < 0
   if (index >= 0) {
-    file.accounts[index] = {
-      ...file.accounts[index],
-      refresh: token.refresh,
-      access: token.access,
-      expires: token.expires,
-    }
+    applyToken(file.accounts[index], token)
   } else {
     file.accounts.push({ id, label, refresh: token.refresh, access: token.access, expires: token.expires })
   }

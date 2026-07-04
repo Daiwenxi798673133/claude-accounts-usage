@@ -1,11 +1,35 @@
 import type { AnthropicOauth, AuthToken, StoredAccount } from "./accounts.ts"
-import { loadAccounts, readAuthAnthropic, saveAccounts, upsertAccount, withAuthLock, writeAuthAnthropic } from "./accounts.ts"
-import { ACTIVE_WAIT_POLL_MS, ACTIVE_WAIT_TIMEOUT_MS, CLIENT_ID, INACTIVE_REFRESH_THRESHOLD_MS, OAUTH_BETA, TOKEN_EXPIRY_BUFFER_MS, TOKEN_URL, USAGE_ENDPOINT } from "./constants.ts"
+import { applyToken, loadAccounts, readAuthAnthropic, saveAccounts, upsertAccount, withAuthLock, writeAuthAnthropic } from "./accounts.ts"
+import { ACTIVE_WAIT_POLL_MS, ACTIVE_WAIT_TIMEOUT_MS, CLIENT_ID, INACTIVE_REFRESH_THRESHOLD_MS, NETWORK_TIMEOUT_MS, OAUTH_BETA, TOKEN_EXPIRY_BUFFER_MS, TOKEN_URL, USAGE_ENDPOINT } from "./constants.ts"
 import { log, redactBody, redactHeaders } from "./logger.ts"
 import { fetchProfile } from "./profile.ts"
 
 const REFRESH_DELAY_MS = 500
 const REFRESH_429_COOLDOWN_MS = 5 * 60_000
+
+// Thrown ONLY for a 400 `invalid_grant` refresh response: the stored refresh token has
+// been rotated out / revoked and can NEVER succeed again. Distinct from transient
+// failures (429/5xx/network) so callers can mark the account for re-login instead of
+// hammering a permanently-dead token every cycle.
+export class RefreshRevokedError extends Error {
+  readonly revoked = true as const
+  constructor(readonly refresh: string) {
+    super("refresh token revoked (invalid_grant)")
+    this.name = "RefreshRevokedError"
+  }
+}
+
+function isInvalidGrant(body: string): boolean {
+  try {
+    return (JSON.parse(body) as { error?: string }).error === "invalid_grant"
+  } catch {
+    return false
+  }
+}
+
+// Row sentinel for an account whose stored refresh token is revoked: the dialog maps it
+// to a "需重新登录" prompt instead of a raw "token refresh failed (400)".
+export const NEEDS_REAUTH_ERROR = "needs-reauth"
 
 const inflightRefresh = new Map<string, Promise<{ access: string; refresh: string; expires: number }>>()
 const refresh429Cooldown = new Map<string, number>()
@@ -29,7 +53,7 @@ export type AccountUsage = {
   usage?: UsageResponse
   error?: string
   pending?: "waiting-refresh" | "refreshing"
-  usageAsOf?: number
+  needsReauth?: boolean
 }
 
 export type ActiveTokenOutcome = {
@@ -75,6 +99,7 @@ function doRefreshToken(refresh: string): Promise<{ access: string; refresh: str
       "User-Agent": "axios/1.13.6",
     },
     body: JSON.stringify({ grant_type: "refresh_token", refresh_token: refresh, client_id: CLIENT_ID }),
+    signal: AbortSignal.timeout(NETWORK_TIMEOUT_MS),
   }).then(async (res) => {
     if (!res.ok) {
       const body = await res.text().catch(() => "")
@@ -85,6 +110,10 @@ function doRefreshToken(refresh: string): Promise<{ access: string; refresh: str
       log.warn("usage:refresh-failed", { status: res.status, headerKeys: redactHeaders(headers), body: redactBody(body) })
       if (res.status === 429) {
         refresh429Cooldown.set(refresh, Date.now() + REFRESH_429_COOLDOWN_MS)
+      }
+      if (res.status === 400 && isInvalidGrant(body)) {
+        log.warn("usage:refresh-revoked")
+        throw new RefreshRevokedError(refresh)
       }
       throw new Error(`token refresh failed (${res.status})`)
     }
@@ -108,10 +137,67 @@ export function refreshToken(refresh: string): Promise<{ access: string; refresh
   return promise
 }
 
+// Escape hatch: one explicit refresh of a needsReauth account (user pressed enter on its
+// row). Success clears the flag via applyToken; a still-revoked token rethrows and keeps
+// the flag. Never called from inside another withAuthLock (sequential lock, no nesting).
+export async function retryFlaggedRefresh(id: string): Promise<void> {
+  await withAuthLock(async () => {
+    const file = await loadAccounts()
+    const account = file.accounts.find((item) => item.id === id)
+    if (!account) throw new Error("account not found")
+    try {
+      const fresh = await refreshToken(account.refresh)
+      applyToken(account, fresh)
+      await saveAccounts(file)
+      log.info("usage:retry-flagged-ok", { id, label: account.label })
+    } catch (error) {
+      if (error instanceof RefreshRevokedError) {
+        const latest = await loadAccounts()
+        const rec = latest.accounts.find((item) => item.id === id)
+        if (rec && !rec.needsReauth && rec.refresh !== error.refresh) {
+          applyToken(account, { refresh: rec.refresh, access: rec.access, expires: rec.expires })
+          await saveAccounts(file)
+          log.info("usage:retry-adopt-rotation", { id, label: account.label })
+          return
+        }
+      }
+      throw error
+    }
+  })
+}
+
+// Idle-time pre-refresh of the ACTIVE chain (auth.json), staggered from ex-machina by
+// construction: ex-machina only refreshes DURING a request, so refreshing while no
+// anthropic session is running can never race it. This keeps the active token fresh so
+// /usage is real-time even if a session starts later, without a "usage_refresh" probe
+// message (which would burn real quota). The isSessionRunning re-check happens INSIDE
+// the lock to shrink the race window to the in-flight POST only (same as selfRefresh).
+const revokedActiveRefresh = new Set<string>()
+
+export async function keepActiveFresh(isSessionRunning: () => boolean): Promise<void> {
+  await withAuthLock(async () => {
+    if (isSessionRunning()) return
+    const auth = await readAuthAnthropic()
+    if (!auth?.refresh) return
+    if (revokedActiveRefresh.has(auth.refresh)) return
+    if (auth.expires && auth.expires >= Date.now() + INACTIVE_REFRESH_THRESHOLD_MS) return
+    if (isRefresh429Cooldown(auth.refresh)) return
+    try {
+      const fresh = await refreshToken(auth.refresh)
+      await writeAuthAnthropic(fresh)
+      log.info("usage:active-keepalive-refreshed")
+    } catch (error) {
+      if (error instanceof RefreshRevokedError) revokedActiveRefresh.add(error.refresh)
+      log.warn("usage:active-keepalive-fail", { error: errorMessage(error) })
+    }
+  })
+}
+
 export async function fetchUsage(access: string): Promise<UsageResponse> {
   log.debug("usage:fetch-start")
   const res = await fetch(USAGE_ENDPOINT, {
     headers: { Authorization: `Bearer ${access}`, "anthropic-beta": OAUTH_BETA },
+    signal: AbortSignal.timeout(NETWORK_TIMEOUT_MS),
   })
   if (!res.ok) {
     log.warn("usage:fetch-fail", { status: res.status })
@@ -142,15 +228,67 @@ export async function autoCapture(): Promise<void> {
   })
 }
 
-async function ensureFresh(account: StoredAccount, bufferMs?: number): Promise<{ access?: string; updated?: StoredAccount }> {
-  if (!isStale(account, bufferMs)) return { access: account.access }
-  if (isRefresh429Cooldown(account.refresh)) {
-    log.warn("usage:refresh-skip-429", { label: account.label })
-    return { access: account.access }
-  }
-  log.debug("usage:ensure-fresh", { label: account.label })
-  const fresh = await refreshToken(account.refresh)
-  return { access: fresh.access, updated: { ...account, ...fresh } }
+// Resolve a usable access token for ONE inactive account, doing the entire
+// read → staleness-check → refresh → persist as a SINGLE withAuthLock critical section.
+// Re-reading the record inside the lock (never trusting the caller's t0 snapshot) is what
+// closes the seeding races: a concurrent switch/collect can neither refresh an
+// already-rotated token nor write a stale one, because it either waits for this block to
+// persist the rotation first, or sees the account has since become active (INV-2 → never
+// touch the auth-held chain) and skips. A rotated token is persisted BEFORE the lock is
+// released, so it is never lost on crash between the refresh and the write.
+type InactiveOutcome = { access?: string; error?: string; refreshed: boolean; needsReauth?: boolean }
+
+function liveAccess(account: StoredAccount | undefined): string | undefined {
+  if (!account?.access || !account.expires) return undefined
+  return account.expires >= Date.now() + TOKEN_EXPIRY_BUFFER_MS ? account.access : undefined
+}
+
+function reauthOutcome(account: StoredAccount | undefined): InactiveOutcome {
+  const access = liveAccess(account)
+  if (access) return { access, refreshed: false, needsReauth: true }
+  return { error: NEEDS_REAUTH_ERROR, refreshed: false, needsReauth: true }
+}
+
+export async function acquireInactiveAccess(id: string): Promise<InactiveOutcome> {
+  return withAuthLock(async () => {
+    const current = await loadAccounts()
+    const account = current.accounts.find((item) => item.id === id)
+    if (!account) return { error: "missing access token", refreshed: false }
+    if (current.activeId === id) return { access: account.access, refreshed: false }
+    if (account.needsReauth) return reauthOutcome(account)
+    if (!isStale(account, INACTIVE_REFRESH_THRESHOLD_MS)) return { access: account.access, refreshed: false }
+    if (isRefresh429Cooldown(account.refresh)) {
+      log.warn("usage:refresh-skip-429", { label: account.label })
+      return { access: account.access, refreshed: false }
+    }
+    try {
+      const fresh = await refreshToken(account.refresh)
+      applyToken(account, fresh)
+      await saveAccounts(current)
+      return { access: fresh.access, refreshed: true }
+    } catch (error) {
+      if (error instanceof RefreshRevokedError) {
+        // Cross-process guard: re-read the store BEFORE flagging. If another OpenCode
+        // window already rotated this account (our POSTed token lost the race), the
+        // account is perfectly healthy — adopt the winner's token instead of branding a
+        // live account as needs-reauth. NEVER adopt a record that is itself flagged:
+        // that would clear another process's dead-chain verdict.
+        const latest = await loadAccounts()
+        const rec = latest.accounts.find((item) => item.id === id)
+        if (rec && !rec.needsReauth && rec.refresh !== error.refresh) {
+          log.info("usage:adopt-foreign-rotation", { id, label: rec.label })
+          return { access: liveAccess(rec), refreshed: false }
+        }
+        if (rec && !rec.needsReauth) {
+          rec.needsReauth = true
+          await saveAccounts(latest)
+          log.warn("usage:account-needs-reauth", { id, label: rec.label })
+        }
+        return reauthOutcome(rec)
+      }
+      throw error
+    }
+  })
 }
 
 function sleep(ms: number): Promise<void> {
@@ -221,29 +359,6 @@ export async function acquireActiveAccess(isSessionRunning: () => boolean): Prom
   return withAuthLock(() => selfRefresh(auth, isSessionRunning))
 }
 
-// Last-good active usage, kept module-level so a deferred/unavailable active row can
-// still render recent data (INV-8). Updated on EVERY successful active fetchUsage.
-let lastActiveUsage: { usage: UsageResponse; at: number } | undefined
-
-// A cached window whose reset moment has already passed is no longer "current" — drop
-// it (null) rather than render a stale bar as if it were live (INV-8, G11).
-function pruneUsage(usage: UsageResponse): UsageResponse {
-  const now = Date.now()
-  const keep = (window: UsageWindow | null | undefined): UsageWindow | null =>
-    window && window.resets_at && Date.parse(window.resets_at) < now ? null : (window ?? null)
-  return {
-    five_hour: keep(usage.five_hour),
-    seven_day: keep(usage.seven_day),
-    seven_day_sonnet: keep(usage.seven_day_sonnet),
-    seven_day_opus: keep(usage.seven_day_opus),
-  }
-}
-
-function cachedActiveRow(base: { id: string; label: string; active: boolean }, fallbackError: string): AccountUsage {
-  if (lastActiveUsage) return { ...base, usage: pruneUsage(lastActiveUsage.usage), usageAsOf: lastActiveUsage.at }
-  return { ...base, error: fallbackError }
-}
-
 export async function collectAllUsage(opts: CollectOptions): Promise<{ activeId?: string; results: AccountUsage[] }> {
   const { isSessionRunning, onPartial } = opts
   const file = await loadAccounts()
@@ -257,49 +372,52 @@ export async function collectAllUsage(opts: CollectOptions): Promise<{ activeId?
     active: true,
   }
 
-  // INACTIVE accounts (everything that is NOT the auth-held/active one): existing
-  // behavior verbatim — proactive 30-min refresh, writes accounts.json only (INV-3).
+  // INACTIVE accounts (everything that is NOT the auth-held/active one): proactive 30-min
+  // refresh via a per-account locked read→refresh→persist (INV-3, writes accounts.json
+  // only). The token POST + its persist live inside acquireInactiveAccess's lock; the
+  // usage fetch runs OUTSIDE the lock so a slow network fetch never starves switches.
   const inactiveAccounts = file.accounts.filter((account) => account !== activeRecord)
   const inactiveResults = new Map<string, AccountUsage>()
-  const updated: StoredAccount[] = []
-  let needsRefresh = false
   for (let index = 0; index < inactiveAccounts.length; index++) {
     const account = inactiveAccounts[index]
     const base = { id: account.id, label: account.label, active: false }
+    let refreshed = false
     try {
-      const { access, updated: fresh } = await ensureFresh(account, INACTIVE_REFRESH_THRESHOLD_MS)
-      if (fresh) {
-        needsRefresh = true
-        updated.push(fresh)
-      }
-      if (!access) {
-        inactiveResults.set(account.id, { ...base, error: "missing access token" })
+      const outcome = await acquireInactiveAccess(account.id)
+      refreshed = outcome.refreshed
+      const flag = outcome.needsReauth ? { needsReauth: true as const } : {}
+      if (outcome.access) {
+        try {
+          const usage = await fetchUsage(outcome.access)
+          inactiveResults.set(account.id, { ...base, usage, ...flag })
+        } catch (fetchError) {
+          log.warn("usage:collect-account-fail", { label: account.label, error: errorMessage(fetchError) })
+          inactiveResults.set(account.id, { ...base, error: errorMessage(fetchError), ...flag })
+        }
       } else {
-        const usage = await fetchUsage(access)
-        inactiveResults.set(account.id, { ...base, usage })
+        inactiveResults.set(account.id, { ...base, error: outcome.error ?? "missing access token", ...flag })
       }
     } catch (error) {
       log.warn("usage:collect-account-fail", { label: account.label, error: errorMessage(error) })
       inactiveResults.set(account.id, { ...base, error: errorMessage(error) })
     }
-    if (needsRefresh && index < inactiveAccounts.length - 1) {
+    if (refreshed && index < inactiveAccounts.length - 1) {
       await sleep(REFRESH_DELAY_MS)
     }
   }
 
   // ACTIVE account: auth.json is the SINGLE source of truth (INV-2/4/5). FRESH → fetch
   // now (real-time); EXPIRED → defer to the resolve phase; no anthropic token → cached
-  // or "未登录". The auth-held chain NEVER enters ensureFresh.
+  // or "未登录". The auth-held chain NEVER enters the inactive refresh path.
   let activeAuth: AuthToken | undefined = toAuthToken(auth)
   let activeFast: AccountUsage | undefined
   let activeDeferred = false
   if (hasActive) {
     if (!auth) {
-      activeFast = cachedActiveRow(activeBase, "未登录")
+      activeFast = { ...activeBase, error: "未登录" }
     } else if (isActiveFresh(auth)) {
       try {
         const usage = await fetchUsage(auth.access)
-        lastActiveUsage = { usage, at: Date.now() }
         activeFast = { ...activeBase, usage }
       } catch (error) {
         log.warn("usage:collect-active-fail", { error: errorMessage(error) })
@@ -328,41 +446,43 @@ export async function collectAllUsage(opts: CollectOptions): Promise<{ activeId?
     if (outcome.access) {
       try {
         const usage = await fetchUsage(outcome.access)
-        lastActiveUsage = { usage, at: Date.now() }
         activeResolved = { ...activeBase, usage }
       } catch (error) {
         log.warn("usage:collect-active-fail", { error: errorMessage(error) })
-        activeResolved = cachedActiveRow(activeBase, errorMessage(error))
+        activeResolved = { ...activeBase, error: errorMessage(error) }
       }
     } else {
-      activeResolved = cachedActiveRow(activeBase, "额度暂不可用(等待 token 刷新)")
+      activeResolved = { ...activeBase, error: "额度暂不可用(等待 token 刷新)" }
     }
     activeAuth = outcome.authToken ?? activeAuth
   }
 
   const results = fastResults.map((row) => (row === activeFast ? activeResolved! : row))
 
-  // REVERSE-SYNC (auth.json → accounts.json only) + persist inactive updates, under a
-  // SEPARATE lock from acquireActiveAccess's (INV-6, never nested). The active record's
-  // token is overwritten from activeAuth — a value that always originated in auth.json.
+  // REVERSE-SYNC the ACTIVE record (auth.json → accounts.json only), under a SEPARATE lock
+  // from acquireActiveAccess's (INV-6, never nested). Inactive rotations are already
+  // persisted per-account by acquireInactiveAccess, so nothing is batched here. The active
+  // record's token is overwritten from activeAuth — a value that always originated in
+  // auth.json.
   const doActiveSync = Boolean(activeRecord && activeAuth?.refresh)
-  if (updated.length > 0 || doActiveSync) {
+  if (doActiveSync && activeRecord && activeAuth) {
     await withAuthLock(async () => {
       const current = await loadAccounts()
-      for (const account of updated) {
-        const index = current.accounts.findIndex((existing) => existing.id === account.id)
-        if (index >= 0) current.accounts[index] = { ...current.accounts[index], ...account }
+      // activeId drifted mid-collect: a concurrent switch already reverse-synced the live
+      // token into this record, so our t0 snapshot is stale — never clobber it.
+      if (current.activeId !== activeRecord.id) {
+        log.debug("usage:active-sync-skip", { was: activeRecord.id, now: current.activeId })
+        return
       }
-      if (doActiveSync && activeRecord && activeAuth) {
-        const index = current.accounts.findIndex((existing) => existing.id === activeRecord.id)
-        if (index >= 0) {
-          current.accounts[index] = {
-            ...current.accounts[index],
-            refresh: activeAuth.refresh,
-            access: activeAuth.access,
-            expires: activeAuth.expires,
-          }
-        }
+      const index = current.accounts.findIndex((existing) => existing.id === activeRecord.id)
+      if (index >= 0) {
+        // Prefer auth.json AS IT IS NOW (ex-machina may have rotated during collect) over the
+        // t0 activeAuth snapshot; fall back to the snapshot only if auth.json lost its refresh.
+        const nowAuth = await readAuthAnthropic()
+        applyToken(
+          current.accounts[index],
+          nowAuth?.refresh ? { refresh: nowAuth.refresh, access: nowAuth.access, expires: nowAuth.expires } : activeAuth,
+        )
       }
       await saveAccounts(current)
     })
@@ -377,6 +497,13 @@ export async function switchToAccount(id: string): Promise<StoredAccount> {
     const index = file.accounts.findIndex((account) => account.id === id)
     if (index < 0) throw new Error("account not found")
 
+    // Never write a known-dead refresh into auth.json — that would brick the active chain
+    // once its still-valid access token expires. Refuse the switch and let the user re-login.
+    if (file.accounts[index].needsReauth) {
+      log.warn("usage:switch-refuse-reauth", { id })
+      throw new Error("账号需重新登录")
+    }
+
     // INV-9 single choke point: reverse-sync the OUTGOING active account's live
     // auth.json token into its accounts.json record BEFORE switching, so a later switch
     // BACK to it uses ex-machina's rotated (fresh) refresh, not a stale one (400
@@ -389,7 +516,7 @@ export async function switchToAccount(id: string): Promise<StoredAccount> {
       if (outAuth?.refresh) {
         const outIdx = file.accounts.findIndex((account) => account.id === file.activeId)
         if (outIdx >= 0) {
-          file.accounts[outIdx] = { ...file.accounts[outIdx], refresh: outAuth.refresh, access: outAuth.access, expires: outAuth.expires }
+          applyToken(file.accounts[outIdx], { refresh: outAuth.refresh, access: outAuth.access, expires: outAuth.expires })
         }
       }
     }
@@ -399,9 +526,30 @@ export async function switchToAccount(id: string): Promise<StoredAccount> {
       if (isRefresh429Cooldown(account.refresh)) {
         log.warn("usage:switch-skip-429", { label: account.label })
       } else {
-        const fresh = await refreshToken(account.refresh)
-        account = { ...account, ...fresh }
-        file.accounts[index] = account
+        try {
+          const fresh = await refreshToken(account.refresh)
+          applyToken(file.accounts[index], fresh)
+          account = file.accounts[index]
+        } catch (error) {
+          if (error instanceof RefreshRevokedError) {
+            const latest = await loadAccounts()
+            const rec = latest.accounts.find((item) => item.id === id)
+            if (rec && !rec.needsReauth && rec.refresh !== error.refresh) {
+              applyToken(file.accounts[index], { refresh: rec.refresh, access: rec.access, expires: rec.expires })
+              account = file.accounts[index]
+              log.info("usage:switch-adopt-rotation", { id, label: account.label })
+            } else {
+              if (rec && !rec.needsReauth) {
+                rec.needsReauth = true
+                await saveAccounts(latest)
+              }
+              log.warn("usage:switch-target-revoked", { id, label: account.label })
+              throw error
+            }
+          } else {
+            throw error
+          }
+        }
       }
     }
 

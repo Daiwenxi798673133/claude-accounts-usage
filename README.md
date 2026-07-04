@@ -109,12 +109,15 @@ cd claude-accounts-usage && bun install
 - **自动收录**:读 `auth.json` 当前账号 → 调 `oauth/profile` 拿到稳定的账号 `uuid` 和邮箱 → 按 `uuid` upsert。`uuid` 跨 token 刷新保持不变,因此同一账号只会被更新(不重复),换成新账号则自动新增。
 - **切换**:把目标账号的 token 写入 `auth.json` 的 `anthropic` 条目。ex-machina 每次请求都会重新读取 `auth.json`,所以切换立即生效(下一条消息就用新账号),无需重启。
 - **查看用量**:对每个账号调用 Anthropic 的 `oauth/usage` 接口;若 access token 过期,会用 refresh token 刷新并回写档案。
+- **后台保活**:插件常驻一个 token keeper——每 5 分钟自动给所有**非活跃**账号续期(快过期才刷);**活跃账号**只在**空闲时**(没有 Anthropic 会话在跑)预刷新,与 ex-machina 天然错开(它只在发请求时刷新),零竞争;同时用文件监听实时跟踪 `auth.json`:ex-machina 每次轮换/每次新登录都会被立即收录,当前账号最新的 refresh token 永不丢失。
+- **实时优先、诚实报错**:面板显示的用量**永远是实时拉取的**,绝不显示缓存旧数据(共享账号场景下旧数据会严重失真)。某账号实时拿不到时直接显示真实错误;refresh token 被服务端**永久吊销**的账号显示"需重新登录"(不参与自动切号、不能手动切入,重新用 ex-machina 登录一次即自动恢复;在其行上按 `enter` 可先尝试一次重试刷新)。若其 access token 尚在有效期内,仍会正常显示实时用量。
 - 始终只读 / 谨慎写 `auth.json` 的 `anthropic` 一项,保留其他 provider 条目不动。
 
 ## 已知限制
 
 - ex-machina 同一时刻只持有一个账号,所以一个新账号必须先用 ex-machina 登录过一次,插件才能在下次加载/操作时收录它。
 - 自动切号依赖 OpenCode 的 `session.status` 事件(辅以 `session.next.retried` / `session.error`),因此只对经由 OpenCode(及 ex-machina)发出的 Anthropic 请求生效;额度恢复后的解除冷却需要该账号成功跑过一次对话。
+- refresh token 是按"登录"分链、一次性轮换的:若某账号的链在服务端被永久吊销(极少数场景),任何客户端都无法再用旧链刷新,该账号需要重新登录一次;插件会将其标为"需重新登录"(access token 未过期时仍显示实时用量),重登后自动恢复。
 
 ## License
 

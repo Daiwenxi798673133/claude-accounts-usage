@@ -1,4 +1,4 @@
-import { OAUTH_BETA, PROFILE_ENDPOINT } from "./constants.ts"
+import { NETWORK_TIMEOUT_MS, OAUTH_BETA, PROFILE_ENDPOINT } from "./constants.ts"
 import { log } from "./logger.ts"
 
 export type Profile = {
@@ -11,6 +11,7 @@ export async function fetchProfile(access: string): Promise<Profile> {
   log.debug("profile:fetch-start")
   const res = await fetch(PROFILE_ENDPOINT, {
     headers: { Authorization: `Bearer ${access}`, "anthropic-beta": OAUTH_BETA },
+    signal: AbortSignal.timeout(NETWORK_TIMEOUT_MS),
   })
   if (!res.ok) {
     log.warn("profile:fetch-fail", { status: res.status })

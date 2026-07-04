@@ -3,7 +3,7 @@ import { createMemo, createSignal, For, Show } from "solid-js"
 import { useKeyboard } from "@opentui/solid"
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import type { StoredAccount } from "./accounts.ts"
-import type { AccountUsage, UsageResponse, UsageWindow } from "./usage.ts"
+import { NEEDS_REAUTH_ERROR, type AccountUsage, type UsageResponse, type UsageWindow } from "./usage.ts"
 
 export type UsageState = {
   loading: boolean
@@ -94,8 +94,11 @@ function AccountRow(props: {
         </Show>
       </box>
       <box flexDirection="column" paddingLeft={4}>
-        <Show when={props.usage?.error}>
+        <Show when={props.usage?.error && props.usage?.error !== NEEDS_REAUTH_ERROR}>
           <text fg={theme().error}>{props.usage?.error}</text>
+        </Show>
+        <Show when={props.usage?.needsReauth || props.usage?.error === NEEDS_REAUTH_ERROR}>
+          <text fg={theme().warning}>需重新登录 (enter 重试刷新)</text>
         </Show>
         <Show when={props.usage?.usage}>
           {(usage) => (
@@ -105,9 +108,6 @@ function AccountRow(props: {
               <ModelWindowRow api={props.api} usage={usage} />
             </box>
           )}
-        </Show>
-        <Show when={props.usage?.usage && props.usage?.usageAsOf}>
-          <text fg={theme().textMuted}>截至 {clockTime(props.usage?.usageAsOf ?? 0)}</text>
         </Show>
         <Show when={props.usage?.pending === "waiting-refresh"}>
           <text fg={theme().textMuted}>等待 token 刷新…</text>

@@ -16,7 +16,7 @@ import { join } from "node:path"
 // POSTs), writes a results JSON, and the parent tests below assert on it.
 const runnerSource = `
 import { test, mock } from "bun:test"
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs"
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync } from "node:fs"
 import { tmpdir, homedir } from "node:os"
 import { join } from "node:path"
 
@@ -39,6 +39,7 @@ const writeAccounts = (obj) => writeFileSync(accountsPath, JSON.stringify(obj))
 const readAccounts = () => JSON.parse(readFileSync(accountsPath, "utf8"))
 
 const future = () => Date.now() + 3600000
+const soon = () => Date.now() + 10 * 60000
 const past = () => Date.now() - 1000
 const bodyPast = () => new Date(Date.now() - 1000).toISOString()
 const bodyFuture = () => new Date(Date.now() + 3600000).toISOString()
@@ -57,6 +58,9 @@ mock.module(join(SRC, "constants.ts"), () => ({
   INACTIVE_REFRESH_THRESHOLD_MS: 1800000,
   ACTIVE_WAIT_TIMEOUT_MS: 80,
   ACTIVE_WAIT_POLL_MS: 5,
+  NETWORK_TIMEOUT_MS: 15000,
+  KEEPALIVE_TICK_MS: 300000,
+  WATCH_DEBOUNCE_MS: 50,
 }))
 
 const USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
@@ -68,13 +72,37 @@ let posts = 0
 let usageFetches = 0
 let profileFetches = 0
 let lastRefreshInput
+const refreshInputs = []
+let slowMs = 50
+let stealTarget
+let profileUuid = "u1"
+const crashNextSave = () => { try { chmodSync(accountsDir, 0o500) } catch {} }
+const healSave = () => { try { chmodSync(accountsDir, 0o700) } catch {} }
 globalThis.fetch = (async (input, init) => {
   const url = String(input)
   if (url === TOKEN_URL) {
     posts++
-    try { lastRefreshInput = JSON.parse(init?.body ?? "{}").refresh_token } catch {}
+    try { lastRefreshInput = JSON.parse(init?.body ?? "{}").refresh_token; refreshInputs.push(lastRefreshInput) } catch {}
     if (refreshMode === "throw-then-fresh") writeAuth(oauth("reread-access", "r-e2", future()))
     if (refreshMode === "429") return { ok: false, status: 429, text: async () => "", headers: { forEach: () => {} } }
+    if (refreshMode === "invalid-grant") return { ok: false, status: 400, text: async () => JSON.stringify({ error: "invalid_grant", error_description: "Refresh token not found or invalid" }), headers: { forEach: () => {} } }
+    if (refreshMode === "steal") {
+      if (stealTarget) {
+        const accs = readAccounts()
+        const rec = accs.accounts.find((a) => a.id === stealTarget.id)
+        if (rec) {
+          rec.refresh = stealTarget.refresh; rec.access = stealTarget.access; rec.expires = stealTarget.expires
+          if (stealTarget.flagged) rec.needsReauth = true
+          else delete rec.needsReauth
+          writeAccounts(accs)
+        }
+      }
+      return { ok: false, status: 400, text: async () => JSON.stringify({ error: "invalid_grant" }), headers: { forEach: () => {} } }
+    }
+    if (refreshMode === "400-other") return { ok: false, status: 400, text: async () => JSON.stringify({ error: "rate_limit_error" }), headers: { forEach: () => {} } }
+    if (refreshMode === "network") throw new Error("network down")
+    if (refreshMode === "slow") { await new Promise((res) => setTimeout(res, slowMs)); return { ok: true, status: 200, json: async () => rotated } }
+    if (refreshMode === "crash-persist") { crashNextSave(); return { ok: true, status: 200, json: async () => rotated } }
     if (refreshMode !== "ok") return { ok: false, status: 500, text: async () => "", headers: { forEach: () => {} } }
     return { ok: true, status: 200, json: async () => rotated }
   }
@@ -84,13 +112,16 @@ globalThis.fetch = (async (input, init) => {
   }
   if (url === PROFILE_ENDPOINT) {
     profileFetches++
-    return { ok: true, status: 200, json: async () => ({ account: { uuid: "u1", email: "a@x.com" } }) }
+    return { ok: true, status: 200, json: async () => ({ account: { uuid: profileUuid, email: profileUuid === "u1" ? "a@x.com" : profileUuid + "@x.com" } }) }
   }
   return { ok: true, status: 200, json: async () => ({}) }
 })
 
-const { acquireActiveAccess, collectAllUsage, autoCapture, switchToAccount } = await import(join(SRC, "usage.ts"))
-const reset = (mode) => { posts = 0; usageFetches = 0; profileFetches = 0; refreshMode = mode; rotated = { access_token: "", refresh_token: "", expires_in: 3600 }; usageBody = {}; lastRefreshInput = undefined }
+const { acquireActiveAccess, collectAllUsage, autoCapture, switchToAccount, refreshToken, retryFlaggedRefresh } = await import(join(SRC, "usage.ts"))
+const { applyToken } = await import(join(SRC, "accounts.ts"))
+let keeper
+try { keeper = await import(join(SRC, "keeper.ts")) } catch { keeper = { keeperTick: async () => {}, onAuthJsonChanged: async () => {} } }
+const reset = (mode) => { posts = 0; usageFetches = 0; profileFetches = 0; refreshMode = mode; rotated = { access_token: "", refresh_token: "", expires_in: 3600 }; usageBody = {}; lastRefreshInput = undefined; refreshInputs.length = 0; slowMs = 50; stealTarget = undefined; profileUuid = "u1" }
 const activeRow = (res) => res.results.find((r) => r.active)
 const cap = (row) => ({ error: row?.error, pending: row?.pending, hasUsage: Boolean(row?.usage), usageAsOf: row?.usageAsOf, fiveHour: row?.usage?.five_hour ?? null, sevenDay: row?.usage?.seven_day ?? null })
 const results = {}
@@ -159,11 +190,6 @@ reset("ok"); writeAuth(oauth("stale-j2", "cooldown-refresh-j", past()))
 reset("ok"); rotated = { access_token: "conc-access", refresh_token: "conc-refresh", expires_in: 3600 }; usageBody = { five_hour: { utilization: 1, resets_at: bodyFuture() } }; writeAuth(oauth("stale-i", "conc-refresh-old", past())); writeAccounts(acctsActive({ id: "acc1", label: "A", refresh: "drift-i", access: "drift-i-a", expires: past() }))
 { await Promise.all([collectAllUsage({ isSessionRunning: () => false }), collectAllUsage({ isSessionRunning: () => false })]); results.ci = { posts } }
 
-reset("ok"); usageBody = { five_hour: { utilization: 90, resets_at: bodyPast() }, seven_day: { utilization: 30, resets_at: bodyFuture() } }; writeAuth(oauth("fresh-k", "auth-refresh-k", future())); writeAccounts(acctsActive({ id: "acc1", label: "A", refresh: "drift-k", access: "drift-k-a", expires: past() }))
-await collectAllUsage({ isSessionRunning: () => false })
-reset("ok"); writeAuth(oauth("stale-k", "auth-refresh-k2", past()))
-{ const res = await collectAllUsage({ isSessionRunning: () => true }); const a = activeRow(res); results.ck = { fiveHour: a.usage?.five_hour ?? null, sevenDay: a.usage?.seven_day ?? null, usageAsOf: a.usageAsOf ?? null, posts } }
-
 // ---- autoCapture scenarios (T3): capture only with a valid token, NEVER refresh ----
 reset("ok"); writeAuth(oauth("cap-access", "cap-refresh", future())); writeAccounts({ version: 1, accounts: [] })
 { await autoCapture(); const accts = readAccounts(); const acc = accts.accounts.find((a) => a.id === "u1"); results.cap_fresh = { posts, profileFetches, activeId: accts.activeId, accId: acc?.id, accLabel: acc?.label, accRefresh: acc?.refresh, accAccess: acc?.access } }
@@ -208,6 +234,286 @@ writeAccounts(acctsAB(
 await switchToAccount("acc2")
 await switchToAccount("acc1")
 { const accs = readAccounts(); const a = accs.accounts.find((x) => x.id === "acc1"); const authNow = readAuth(); results.sw_roundtrip = { posts, lastRefreshInput: lastRefreshInput ?? null, aRefresh: a.refresh, authRefresh: authNow.refresh, authAccess: authNow.access } }
+
+// ---- Component B (T1): refresh error classification ----
+reset("invalid-grant")
+{ let e; try { await refreshToken("dead-ig") } catch (err) { e = err } results.cls_ig = { name: e?.name, revoked: e?.revoked === true, message: e?.message } }
+reset("400-other")
+{ let e; try { await refreshToken("dead-400") } catch (err) { e = err } results.cls_400 = { name: e?.name, revoked: e?.revoked === true, message: e?.message } }
+reset("throw")
+{ let e; try { await refreshToken("dead-500") } catch (err) { e = err } results.cls_500 = { name: e?.name, revoked: e?.revoked === true, message: e?.message } }
+reset("network")
+{ let e; try { await refreshToken("dead-net") } catch (err) { e = err } results.cls_net = { name: e?.name, revoked: e?.revoked === true, message: e?.message } }
+
+// ---- Component C (T3): applyToken clears needsReauth; re-login self-clear ----
+{
+  const rec = { id: "x", label: "X", refresh: "old", access: "old-a", expires: past(), needsReauth: true }
+  let threw = false
+  try { applyToken(rec, { refresh: "new", access: "new-a", expires: future() }) } catch { threw = true }
+  results.apply_unit = { threw, isFn: typeof applyToken === "function", refresh: rec.refresh, access: rec.access, hasFlag: "needsReauth" in rec }
+}
+
+reset("ok"); writeAuth(oauth("cap2-access", "cap2-refresh", future())); writeAccounts({ version: 1, activeId: "u1", accounts: [{ id: "u1", label: "old@x.com", refresh: "dead-cap", access: "dead-a", expires: past(), needsReauth: true }] })
+{ await autoCapture(); const acc = readAccounts().accounts.find((a) => a.id === "u1"); results.cap_relogin = { hasFlag: acc ? ("needsReauth" in acc) : true, refresh: acc?.refresh, access: acc?.access } }
+
+// ---- Component C collect (T5): skip flagged + flag on revoked (tests 2, 9) ----
+reset("invalid-grant"); usageBody = { five_hour: { utilization: 5, resets_at: bodyFuture() } }
+writeAuth(oauth("cB-auth-a", "cB-auth-r", future()))
+writeAccounts({ version: 1, activeId: "acc1", accounts: [{ id: "acc1", label: "A", refresh: "acc1-r", access: "acc1-a", expires: future() }, { id: "accB", label: "B", refresh: "dead-r", access: "dead-a", expires: past() }] })
+{
+  const res1 = await collectAllUsage({ isSessionRunning: () => false }); const bRow1 = res1.results.find((x) => x.id === "accB"); const accB1 = readAccounts().accounts.find((a) => a.id === "accB"); const posts1 = posts
+  reset("invalid-grant"); usageBody = { five_hour: { utilization: 5, resets_at: bodyFuture() } }
+  const res2 = await collectAllUsage({ isSessionRunning: () => false }); const bRow2 = res2.results.find((x) => x.id === "accB")
+  results.creauth = { row1Error: bRow1?.error, flagged: accB1?.needsReauth === true, posts1, row2Error: bRow2?.error, posts2: posts }
+}
+
+reset("ok"); usageBody = { five_hour: { utilization: 5, resets_at: bodyFuture() } }
+writeAuth(oauth("c9-auth-a", "c9-auth-r", future()))
+writeAccounts({ version: 1, activeId: "acc1", accounts: [{ id: "acc1", label: "A", refresh: "acc1-r", access: "acc1-a", expires: future() }, { id: "accN", label: "N", refresh: "n-r", needsReauth: true }] })
+{ let threw = false; let res; try { res = await collectAllUsage({ isSessionRunning: () => false }) } catch { threw = true } const nRow = res?.results.find((x) => x.id === "accN"); results.creauth_noaccess = { threw, posts, rowError: nRow?.error } }
+
+// ---- Component C switch (T7): refuse flagged target / flag-on-revoked / reverse-sync clear (tests 3, 8b) ----
+reset("ok")
+writeAuth(oauth("sw3-auth-a", "sw3-auth-r", future()))
+writeAccounts({ version: 1, activeId: "acc1", accounts: [{ id: "acc1", label: "A", refresh: "A-r", access: "A-a", expires: future() }, { id: "accB", label: "B", refresh: "B-dead", access: "B-fresh-a", expires: future(), needsReauth: true }] })
+{ const authBefore = readFileSync(authPath, "utf8"); let threw = false; let msg; try { await switchToAccount("accB") } catch (e) { threw = true; msg = e?.message } const authAfter = readFileSync(authPath, "utf8"); results.sw_flagged = { threw, msg, authUnchanged: authBefore === authAfter, activeId: readAccounts().activeId, posts } }
+
+reset("invalid-grant")
+writeAuth(oauth("sw4-auth-a", "sw4-auth-r", future()))
+writeAccounts({ version: 1, activeId: "acc1", accounts: [{ id: "acc1", label: "A", refresh: "A-r2", access: "A-a2", expires: future() }, { id: "accB", label: "B", refresh: "B-dead2", access: "B-old-a", expires: past() }] })
+{ const authBefore = readFileSync(authPath, "utf8"); let threw = false; try { await switchToAccount("accB") } catch { threw = true } const accB = readAccounts().accounts.find((a) => a.id === "accB"); const authAfter = readFileSync(authPath, "utf8"); results.sw_revoked = { threw, flagged: accB?.needsReauth === true, authUnchanged: authBefore === authAfter, activeId: readAccounts().activeId } }
+
+reset("ok")
+writeAuth(oauth("A-live-a-8b", "A-live-r-8b", future()))
+writeAccounts({ version: 1, activeId: "acc1", accounts: [{ id: "acc1", label: "A", refresh: "A-stale-dead", access: "A-stale-a", expires: past(), needsReauth: true }, { id: "accB", label: "B", refresh: "B-fresh-r", access: "B-fresh-a", expires: future() }] })
+{ await switchToAccount("accB"); const accA = readAccounts().accounts.find((a) => a.id === "acc1"); results.sw_outgoing_clear = { aRefresh: accA?.refresh, aHasFlag: accA ? ("needsReauth" in accA) : true, activeId: readAccounts().activeId } }
+
+// ---- Component C retry hatch (T10): retryFlaggedRefresh success clears / failure keeps flag (test 8c) ----
+reset("ok"); rotated = { access_token: "retry-new-a", refresh_token: "retry-new-r", expires_in: 3600 }
+writeAuth(oauth("rt-auth-a", "rt-auth-r", future()))
+writeAccounts({ version: 1, activeId: "acc1", accounts: [{ id: "acc1", label: "A", refresh: "acc1-r", access: "acc1-a", expires: future() }, { id: "accB", label: "B", refresh: "B-was-dead", access: "B-a", expires: past(), needsReauth: true }] })
+{ let threw = false; try { await retryFlaggedRefresh("accB") } catch { threw = true } const accB = readAccounts().accounts.find((a) => a.id === "accB"); results.retry_ok = { threw, isFn: typeof retryFlaggedRefresh === "function", refresh: accB?.refresh, hasFlag: accB ? ("needsReauth" in accB) : true, posts } }
+
+reset("invalid-grant")
+writeAuth(oauth("rt2-auth-a", "rt2-auth-r", future()))
+writeAccounts({ version: 1, activeId: "acc1", accounts: [{ id: "acc1", label: "A", refresh: "acc1-r", access: "acc1-a", expires: future() }, { id: "accB", label: "B", refresh: "B-still-dead", access: "B-a", expires: past(), needsReauth: true }] })
+{ let threw = false; try { await retryFlaggedRefresh("accB") } catch { threw = true } const accB = readAccounts().accounts.find((a) => a.id === "accB"); results.retry_fail = { threw, stillFlagged: accB?.needsReauth === true, refresh: accB?.refresh } }
+
+// ---- Component A (T11): PATH-5 concurrency / switch-before-turn / crash-window (tests 4, 5, 7) ----
+reset("slow"); slowMs = 60; rotated = { access_token: "R2-a", refresh_token: "R2", expires_in: 3600 }; usageBody = { five_hour: { utilization: 5, resets_at: bodyFuture() } }
+writeAuth(oauth("A-auth-a", "A-auth-r", future()))
+writeAccounts({ version: 1, activeId: "acc1", accounts: [{ id: "acc1", label: "A", refresh: "acc1-r", access: "acc1-a", expires: future() }, { id: "accB", label: "B", refresh: "R1", access: "B-a", expires: soon() }] })
+{
+  const collectP = collectAllUsage({ isSessionRunning: () => false })
+  await new Promise((res) => setTimeout(res, 15))
+  const switchP = switchToAccount("accB")
+  await Promise.allSettled([collectP, switchP])
+  const accs = readAccounts(); const authNow = readAuth(); const accB = accs.accounts.find((a) => a.id === "accB")
+  results.race_path5 = { posts, lastRefreshInput, authRefresh: authNow?.refresh, accBRefresh: accB?.refresh, activeId: accs.activeId }
+}
+
+reset("slow"); slowMs = 60; rotated = { access_token: "slowA-new-a", refresh_token: "slowA-new-r", expires_in: 3600 }; usageBody = { five_hour: { utilization: 5, resets_at: bodyFuture() } }
+writeAuth(oauth("act-auth-a", "act-auth-r", future()))
+writeAccounts({ version: 1, activeId: "act", accounts: [{ id: "act", label: "ACT", refresh: "act-r", access: "act-a", expires: future() }, { id: "slowA", label: "SA", refresh: "slowA-r", access: "slowA-a", expires: past() }, { id: "accB", label: "B", refresh: "B-R", access: "B-a", expires: soon() }] })
+{
+  const collectP = collectAllUsage({ isSessionRunning: () => false })
+  await new Promise((res) => setTimeout(res, 15))
+  const switchP = switchToAccount("accB")
+  await Promise.allSettled([collectP, switchP])
+  const authNow = readAuth(); const accs = readAccounts()
+  results.race_before_turn = { bPosts: refreshInputs.filter((x) => x === "B-R").length, authRefresh: authNow?.refresh, activeId: accs.activeId }
+}
+
+reset("crash-persist"); rotated = { access_token: "c7-r2-a", refresh_token: "c7-R2", expires_in: 3600 }; usageBody = { five_hour: { utilization: 5, resets_at: bodyFuture() } }
+writeAuth(oauth("c7-auth-a", "c7-auth-r", future()))
+writeAccounts({ version: 1, activeId: "acc1", accounts: [{ id: "acc1", label: "A", refresh: "acc1-r", access: "acc1-a", expires: future() }, { id: "accB", label: "B", refresh: "c7-R1", access: "B-a", expires: past() }] })
+{
+  let threw = false
+  try { await collectAllUsage({ isSessionRunning: () => false }) } catch { threw = true }
+  healSave()
+  const crashRefresh = readAccounts().accounts.find((a) => a.id === "accB")?.refresh
+  reset("invalid-grant"); usageBody = { five_hour: { utilization: 5, resets_at: bodyFuture() } }; writeAuth(oauth("c7-auth-a", "c7-auth-r", future()))
+  await collectAllUsage({ isSessionRunning: () => false })
+  const flaggedCycle2 = readAccounts().accounts.find((a) => a.id === "accB")?.needsReauth === true
+  reset("invalid-grant"); usageBody = { five_hour: { utilization: 5, resets_at: bodyFuture() } }; writeAuth(oauth("c7-auth-a", "c7-auth-r", future()))
+  await collectAllUsage({ isSessionRunning: () => false })
+  results.crash7 = { threw, crashRefresh, flaggedCycle2, posts3: posts }
+}
+
+// ---- Component D (T13): doActiveSync guard against activeId drift / mid-collect rotation (test 6) ----
+reset("slow"); slowMs = 80; rotated = { access_token: "slowX-new-a", refresh_token: "slowX-new-r", expires_in: 3600 }; usageBody = { five_hour: { utilization: 5, resets_at: bodyFuture() } }
+writeAuth(oauth("A-v1-a", "A-v1-r", future()))
+writeAccounts({ version: 1, activeId: "accA", accounts: [{ id: "accA", label: "A", refresh: "A-stored", access: "A-stored-a", expires: future() }, { id: "slowX", label: "SX", refresh: "slowX-r", access: "slowX-a", expires: past() }, { id: "accB", label: "B", refresh: "B-r", access: "B-a", expires: future() }] })
+{
+  const collectP = collectAllUsage({ isSessionRunning: () => false })
+  await new Promise((res) => setTimeout(res, 20))
+  writeAuth(oauth("A-v2-a", "A-v2-r", future()))
+  await switchToAccount("accB")
+  await collectP
+  const accA = readAccounts().accounts.find((a) => a.id === "accA")
+  results.dsync_drift = { aRefresh: accA?.refresh, activeId: readAccounts().activeId }
+}
+
+reset("slow"); slowMs = 80; rotated = { access_token: "slowY-new-a", refresh_token: "slowY-new-r", expires_in: 3600 }; usageBody = { five_hour: { utilization: 5, resets_at: bodyFuture() } }
+writeAuth(oauth("AA-v1-a", "AA-v1-r", future()))
+writeAccounts({ version: 1, activeId: "accA", accounts: [{ id: "accA", label: "A", refresh: "AA-stored", access: "AA-stored-a", expires: future() }, { id: "slowY", label: "SY", refresh: "slowY-r", access: "slowY-a", expires: past() }] })
+{
+  const collectP = collectAllUsage({ isSessionRunning: () => false })
+  await new Promise((res) => setTimeout(res, 20))
+  writeAuth(oauth("AA-v2-a", "AA-v2-r", future()))
+  await collectP
+  const accA = readAccounts().accounts.find((a) => a.id === "accA")
+  results.dsync_rotate = { aRefresh: accA?.refresh, activeId: readAccounts().activeId }
+}
+
+// ---- Round 2: cross-process adopt-guard (another process rotated the token mid-POST) ----
+reset("steal"); stealTarget = { id: "gB", refresh: "G2", access: "g2a", expires: future() }; usageBody = { five_hour: { utilization: 8, resets_at: bodyFuture() } }
+writeAuth(oauth("gA-auth-a", "gA-auth-r", future()))
+writeAccounts({ version: 1, activeId: "gA", accounts: [{ id: "gA", label: "GA", refresh: "gA-r", access: "gA-a", expires: future() }, { id: "gB", label: "GB", refresh: "G1", access: "g1a", expires: past() }] })
+{
+  const res = await collectAllUsage({ isSessionRunning: () => false })
+  const bRow = res.results.find((x) => x.id === "gB")
+  const accB = readAccounts().accounts.find((a) => a.id === "gB")
+  results.guard_adopt = { posts, bRefresh: accB?.refresh, flagged: accB?.needsReauth === true, rowHasUsage: Boolean(bRow?.usage), rowError: bRow?.error }
+}
+
+reset("steal"); stealTarget = { id: "sB", refresh: "S2", access: "s2a", expires: future() }
+writeAuth(oauth("sA-auth-a", "sA-auth-r", future()))
+writeAccounts({ version: 1, activeId: "sA", accounts: [{ id: "sA", label: "SA", refresh: "sA-r", access: "sA-a", expires: future() }, { id: "sB", label: "SB", refresh: "S1", access: "s1a", expires: past() }] })
+{
+  let threw = false
+  try { await switchToAccount("sB") } catch { threw = true }
+  const accB = readAccounts().accounts.find((a) => a.id === "sB")
+  results.switch_adopt = { threw, authRefresh: readAuth()?.refresh, bRefresh: accB?.refresh, flagged: accB?.needsReauth === true, activeId: readAccounts().activeId }
+}
+
+reset("steal"); stealTarget = { id: "rB", refresh: "R2x", access: "r2xa", expires: future() }
+writeAuth(oauth("rA-auth-a", "rA-auth-r", future()))
+writeAccounts({ version: 1, activeId: "rA", accounts: [{ id: "rA", label: "RA", refresh: "rA-r", access: "rA-a", expires: future() }, { id: "rB", label: "RB", refresh: "R1x", access: "r1xa", expires: past(), needsReauth: true }] })
+{
+  let threw = false
+  try { await retryFlaggedRefresh("rB") } catch { threw = true }
+  const accB = readAccounts().accounts.find((a) => a.id === "rB")
+  results.retry_adopt = { threw, bRefresh: accB?.refresh, flagged: accB?.needsReauth === true }
+}
+
+// ---- Round 2b: adopt-guard must NOT adopt a record that is itself flagged (reviewer must-fix) ----
+reset("steal"); stealTarget = { id: "fB", refresh: "F2", access: "f2a", expires: future(), flagged: true }
+writeAuth(oauth("fA-auth-a", "fA-auth-r", future()))
+writeAccounts({ version: 1, activeId: "fA", accounts: [{ id: "fA", label: "FA", refresh: "fA-r", access: "fA-a", expires: future() }, { id: "fB", label: "FB", refresh: "F1", access: "f1a", expires: past() }] })
+{
+  const authBefore = readFileSync(authPath, "utf8")
+  let threw = false
+  try { await switchToAccount("fB") } catch { threw = true }
+  const accB = readAccounts().accounts.find((a) => a.id === "fB")
+  results.switch_no_adopt_flagged = { threw, authUnchanged: readFileSync(authPath, "utf8") === authBefore, bRefresh: accB?.refresh, flagged: accB?.needsReauth === true, activeId: readAccounts().activeId }
+}
+
+reset("steal"); stealTarget = { id: "fC", refresh: "FC2", access: "fc2a", expires: future(), flagged: true }; usageBody = { five_hour: { utilization: 9, resets_at: bodyFuture() } }
+writeAuth(oauth("fA2-auth-a", "fA2-auth-r", future()))
+writeAccounts({ version: 1, activeId: "fA2", accounts: [{ id: "fA2", label: "FA2", refresh: "fA2-r", access: "fA2-a", expires: future() }, { id: "fC", label: "FC", refresh: "FC1", access: "fc1a", expires: past() }] })
+{
+  const res = await collectAllUsage({ isSessionRunning: () => false })
+  const cRow = res.results.find((x) => x.id === "fC")
+  const accC = readAccounts().accounts.find((a) => a.id === "fC")
+  results.acquire_no_adopt_flagged = { cRefresh: accC?.refresh, cFlagged: accC?.needsReauth === true, rowNeedsReauth: cRow?.needsReauth === true, rowHasUsage: Boolean(cRow?.usage) }
+}
+
+reset("steal"); stealTarget = { id: "fD", refresh: "FD2", access: "fd2a", expires: future(), flagged: true }
+writeAuth(oauth("fA3-auth-a", "fA3-auth-r", future()))
+writeAccounts({ version: 1, activeId: "fA3", accounts: [{ id: "fA3", label: "FA3", refresh: "fA3-r", access: "fA3-a", expires: future() }, { id: "fD", label: "FD", refresh: "FD1", access: "fd1a", expires: past(), needsReauth: true }] })
+{
+  let threw = false
+  try { await retryFlaggedRefresh("fD") } catch { threw = true }
+  const accD = readAccounts().accounts.find((a) => a.id === "fD")
+  results.retry_no_adopt_flagged = { threw, dRefresh: accD?.refresh, flagged: accD?.needsReauth === true }
+}
+
+// ---- Round 2: access-first display + persisted per-account usage cache ----
+reset("ok"); usageBody = { five_hour: { utilization: 33, resets_at: bodyFuture() } }
+writeAuth(oauth("afA-auth-a", "afA-auth-r", future()))
+writeAccounts({ version: 1, activeId: "afA", accounts: [{ id: "afA", label: "AFA", refresh: "afA-r", access: "afA-a", expires: future() }, { id: "afB", label: "AFB", refresh: "afB-dead", access: "afB-live-a", expires: future(), needsReauth: true }] })
+{
+  const res = await collectAllUsage({ isSessionRunning: () => false })
+  const bRow = res.results.find((x) => x.id === "afB")
+  results.access_first = { posts, rowHasUsage: Boolean(bRow?.usage), rowNeedsReauth: bRow?.needsReauth === true, rowError: bRow?.error }
+}
+
+reset("ok"); usageBody = { five_hour: { utilization: 77, resets_at: bodyFuture() } }
+writeAuth(oauth("cfA-auth-a", "cfA-auth-r", future()))
+writeAccounts({ version: 1, activeId: "cfA", accounts: [{ id: "cfA", label: "CFA", refresh: "cfA-r", access: "cfA-a", expires: future() }, { id: "cfB", label: "CFB", refresh: "cfB-r", access: "cfB-a", expires: future() }] })
+{
+  await collectAllUsage({ isSessionRunning: () => false })
+  writeAccounts({ version: 1, activeId: "cfA", accounts: [{ id: "cfA", label: "CFA", refresh: "cfA-r", access: "cfA-a", expires: future() }, { id: "cfB", label: "CFB", refresh: "cfB-dead", needsReauth: true }] })
+  reset("invalid-grant"); usageBody = { five_hour: { utilization: 77, resets_at: bodyFuture() } }
+  const res2 = await collectAllUsage({ isSessionRunning: () => false })
+  const bRow2 = res2.results.find((x) => x.id === "cfB")
+  let cacheExists = true
+  try { readFileSync(join(homedir(), ".config", "opencode", "claude-usage-cache.json"), "utf8") } catch { cacheExists = false }
+  results.nocache = { rowError: bRow2?.error, rowHasUsage: Boolean(bRow2?.usage), rowNeedsReauth: bRow2?.needsReauth === true, cacheExists }
+}
+
+// ---- Round 2: token keeper (background keep-alive tick + auth.json change capture) ----
+reset("ok"); rotated = { access_token: "kB-new-a", refresh_token: "kB-new-r", expires_in: 3600 }
+writeAuth(oauth("kA-auth-a", "kA-auth-r", future()))
+writeAccounts({ version: 1, activeId: "kA", accounts: [
+  { id: "kA", label: "KA", refresh: "kA-r", access: "kA-a", expires: past() },
+  { id: "kB", label: "KB", refresh: "kB-r", access: "kB-a", expires: past() },
+  { id: "kC", label: "KC", refresh: "kC-r", needsReauth: true },
+  { id: "kD", label: "KD", refresh: "kD-r", access: "kD-a", expires: future() },
+] })
+{
+  await keeper.keeperTick(() => false)
+  const accs = readAccounts().accounts
+  results.keeper_tick = { posts, inputs: [...refreshInputs], bRefresh: accs.find((a) => a.id === "kB")?.refresh, cFlagged: accs.find((a) => a.id === "kC")?.needsReauth === true, aRefresh: accs.find((a) => a.id === "kA")?.refresh }
+}
+
+// ---- Round 3: keeper keeps the ACTIVE chain fresh while idle (staggered from ex-machina) ----
+reset("ok"); rotated = { access_token: "kact-new-a", refresh_token: "kact-new-r", expires_in: 3600 }
+writeAuth(oauth("kact-a", "kact-r", Date.now() + 10 * 60000))
+writeAccounts({ version: 1, activeId: "kX", accounts: [{ id: "kX", label: "KX", refresh: "kX-r", access: "kX-a", expires: future() }] })
+{
+  await keeper.keeperTick(() => false)
+  const authNow = readAuth()
+  results.keeper_active = { posts, inputs: [...refreshInputs], authRefresh: authNow?.refresh, authAccess: authNow?.access }
+}
+
+reset("ok"); writeAuth(oauth("krun-a", "krun-r", Date.now() + 10 * 60000))
+writeAccounts({ version: 1, activeId: "kX", accounts: [{ id: "kX", label: "KX", refresh: "kX-r", access: "kX-a", expires: future() }] })
+{
+  await keeper.keeperTick(() => true)
+  results.keeper_active_running = { posts, authRefresh: readAuth()?.refresh }
+}
+
+reset("invalid-grant"); writeAuth(oauth("kdead-a", "kdead-r", past()))
+writeAccounts({ version: 1, activeId: "kX", accounts: [{ id: "kX", label: "KX", refresh: "kX-r", access: "kX-a", expires: future() }] })
+{
+  await keeper.keeperTick(() => false)
+  const postsAfterFirst = posts
+  await keeper.keeperTick(() => false)
+  results.keeper_active_dead = { postsAfterFirst, postsAfterSecond: posts, authRefresh: readAuth()?.refresh }
+}
+
+reset("ok"); profileUuid = "u7"
+writeAuth(oauth("u7-access", "u7-refresh", future()))
+writeAccounts({ version: 1, activeId: "kA", accounts: [{ id: "kA", label: "KA", refresh: "kA-r2", access: "kA-a2", expires: future() }] })
+{
+  await keeper.onAuthJsonChanged()
+  const accs = readAccounts()
+  const u7 = accs.accounts.find((a) => a.id === "u7")
+  results.keeper_capture = { captured: Boolean(u7), u7Refresh: u7?.refresh, activeId: accs.activeId }
+}
+writeAuth(oauth("u7-access-2", "u7-refresh-2", future()))
+{
+  await keeper.onAuthJsonChanged()
+  const u7 = readAccounts().accounts.find((a) => a.id === "u7")
+  results.keeper_rotate = { u7Refresh: u7?.refresh, u7Access: u7?.access }
+}
+{
+  const before = profileFetches
+  await keeper.onAuthJsonChanged()
+  results.keeper_skip = { extraProfile: profileFetches - before }
+}
 
 writeFileSync(OUT, JSON.stringify(results))
 test("acquireActiveAccess scenarios executed", () => {})
@@ -258,13 +564,53 @@ type SwitchRow = {
   threw?: boolean
   lastRefreshInput?: string | null
 }
+type ClsRow = { name?: string; revoked?: boolean; message?: string }
+type ApplyRow = { threw?: boolean; isFn?: boolean; refresh?: string; access?: string; hasFlag?: boolean }
+type ReloginRow = { hasFlag?: boolean; refresh?: string; access?: string }
+type ReauthCollectRow = { row1Error?: string; flagged?: boolean; posts1?: number; row2Error?: string; posts2?: number }
+type ReauthNoAccessRow = { threw?: boolean; posts?: number; rowError?: string }
+type SwFlaggedRow = { threw?: boolean; msg?: string; authUnchanged?: boolean; activeId?: string; posts?: number }
+type SwRevokedRow = { threw?: boolean; flagged?: boolean; authUnchanged?: boolean; activeId?: string }
+type SwOutgoingClearRow = { aRefresh?: string; aHasFlag?: boolean; activeId?: string }
+type RetryOkRow = { threw?: boolean; isFn?: boolean; refresh?: string; hasFlag?: boolean; posts?: number }
+type RetryFailRow = { threw?: boolean; stillFlagged?: boolean; refresh?: string }
+type RacePath5Row = { posts?: number; lastRefreshInput?: string; authRefresh?: string; accBRefresh?: string; activeId?: string }
+type RaceBeforeTurnRow = { bPosts?: number; authRefresh?: string; activeId?: string }
+type Crash7Row = { threw?: boolean; crashRefresh?: string; flaggedCycle2?: boolean; posts3?: number }
+type DsyncRow = { aRefresh?: string; activeId?: string }
+type GuardAdoptRow = { posts?: number; bRefresh?: string; flagged?: boolean; rowHasUsage?: boolean; rowError?: string }
+type SwitchAdoptRow = { threw?: boolean; authRefresh?: string; bRefresh?: string; flagged?: boolean; activeId?: string }
+type RetryAdoptRow = { threw?: boolean; bRefresh?: string; flagged?: boolean }
+type AccessFirstRow = { posts?: number; rowHasUsage?: boolean; rowNeedsReauth?: boolean; rowError?: string }
+type NocacheRow = { rowError?: string; rowHasUsage?: boolean; rowNeedsReauth?: boolean; cacheExists?: boolean }
+type KeeperActiveRow = { posts?: number; inputs?: string[]; authRefresh?: string; authAccess?: string }
+type KeeperActiveDeadRow = { postsAfterFirst?: number; postsAfterSecond?: number; authRefresh?: string }
+type KeeperTickRow = { posts?: number; inputs?: string[]; bRefresh?: string; cFlagged?: boolean; aRefresh?: string }
+type KeeperCaptureRow = { captured?: boolean; u7Refresh?: string; activeId?: string }
+type KeeperRotateRow = { u7Refresh?: string; u7Access?: string }
+type KeeperSkipRow = { extraProfile?: number }
+type SwitchNoAdoptRow = { threw?: boolean; authUnchanged?: boolean; bRefresh?: string; flagged?: boolean; activeId?: string }
+type AcquireNoAdoptRow = { cRefresh?: string; cFlagged?: boolean; rowNeedsReauth?: boolean; rowHasUsage?: boolean }
+type RetryNoAdoptRow = { threw?: boolean; dRefresh?: string; flagged?: boolean }
 type Results = {
   a: Outcome; b: Outcome; c: Outcome; d: Outcome; e: Outcome; f: Outcome; g: Outcome
   ch_missing: CollectRow; ch_openai: CollectRow; ca: CollectRow; ce: CollectRow; cd: CollectRow
   cb: CollectRow; cf: CollectRow; cg: CollectRow; cc: CollectRow; h_noactive: CollectRow
-  cj: CollectRow; ci: CollectRow; ck: CollectRow
+  cj: CollectRow; ci: CollectRow
   cap_fresh: CaptureRow; cap_expired: CaptureRow; cap_noauth: CaptureRow
   sw_reverse: SwitchRow; sw_noauth: SwitchRow; sw_roundtrip: SwitchRow
+  cls_ig: ClsRow; cls_400: ClsRow; cls_500: ClsRow; cls_net: ClsRow
+  apply_unit: ApplyRow; cap_relogin: ReloginRow
+  creauth: ReauthCollectRow; creauth_noaccess: ReauthNoAccessRow
+  sw_flagged: SwFlaggedRow; sw_revoked: SwRevokedRow; sw_outgoing_clear: SwOutgoingClearRow
+  retry_ok: RetryOkRow; retry_fail: RetryFailRow
+  race_path5: RacePath5Row; race_before_turn: RaceBeforeTurnRow; crash7: Crash7Row
+  dsync_drift: DsyncRow; dsync_rotate: DsyncRow
+  guard_adopt: GuardAdoptRow; switch_adopt: SwitchAdoptRow; retry_adopt: RetryAdoptRow
+  access_first: AccessFirstRow; nocache: NocacheRow
+  keeper_tick: KeeperTickRow; keeper_capture: KeeperCaptureRow; keeper_rotate: KeeperRotateRow; keeper_skip: KeeperSkipRow
+  keeper_active: KeeperActiveRow; keeper_active_running: KeeperActiveRow; keeper_active_dead: KeeperActiveDeadRow
+  switch_no_adopt_flagged: SwitchNoAdoptRow; acquire_no_adopt_flagged: AcquireNoAdoptRow; retry_no_adopt_flagged: RetryNoAdoptRow
 }
 
 const runnerDir = mkdtempSync(join(tmpdir(), "cau-parent-"))
@@ -368,10 +714,10 @@ test("collectAllUsage (f) RUNNING poll success — token flips fresh mid-poll �
   expect(r.cf.accRefresh).toBe("exmachina-f-refresh")
 })
 
-test("collectAllUsage (g) RUNNING timeout → cached row + usageAsOf, 0 POSTs", () => {
+test("collectAllUsage (g) RUNNING timeout → honest unavailable error, NO cached bars, 0 POSTs", () => {
   expect(r.cg.posts).toBe(0)
-  expect(r.cg.hasUsage).toBe(true)
-  expect(typeof r.cg.usageAsOf).toBe("number")
+  expect(r.cg.hasUsage).toBe(false)
+  expect(r.cg.error).toBe("额度暂不可用(等待 token 刷新)")
 })
 
 test("collectAllUsage (h) activeId undefined + auth FRESH → synthesized active row, 0 POSTs for auth-held account", () => {
@@ -395,17 +741,13 @@ test("collectAllUsage (i) concurrent modal + background overlap → exactly ONE 
   expect(r.ci.posts).toBe(1)
 })
 
-test("collectAllUsage (j) IDLE + refresh429Cooldown active → skip refresh, cached shown, 0 POSTs", () => {
+test("collectAllUsage (j) IDLE + refresh429Cooldown active → skip refresh, honest unavailable error, 0 POSTs", () => {
   expect(r.cj.posts).toBe(0)
-  expect(r.cj.hasUsage).toBe(true)
+  expect(r.cj.hasUsage).toBe(false)
+  expect(r.cj.error).toBe("额度暂不可用(等待 token 刷新)")
 })
 
-test("collectAllUsage (k) cached window past its resets_at is pruned (not rendered as current)", () => {
-  expect(r.ck.fiveHour).toBe(null)
-  expect(r.ck.sevenDay).not.toBe(null)
-  expect(typeof r.ck.usageAsOf).toBe("number")
-  expect(r.ck.posts).toBe(0)
-})
+
 
 test("autoCapture (a) auth FRESH → fetchProfile + upsertAccount store token AS-IS, 0 POSTs to TOKEN_URL", () => {
   expect(r.cap_fresh.posts).toBe(0)
@@ -434,7 +776,7 @@ test("autoCapture (malformed) auth.json missing → early return, no crash, noth
 test("autoCapture (c) body calls only lock-free fns — no refreshToken, no writeAuthAnthropic, single withAuthLock (no nesting)", () => {
   const src = readFileSync(join(import.meta.dir, "usage.ts"), "utf8")
   const start = src.indexOf("export async function autoCapture")
-  const raw = src.slice(start, src.indexOf("\nasync function ensureFresh", start))
+  const raw = src.slice(start, src.indexOf("\ntype InactiveOutcome", start))
   const code = raw
     .split("\n")
     .filter((line) => !line.trim().startsWith("//"))
@@ -474,4 +816,215 @@ test("switchToAccount (d) REGRESSION round-trip A→B→A uses the LIVE (rotated
   expect(r.sw_roundtrip.aRefresh).toBe("A-live-refresh")
   expect(r.sw_roundtrip.authRefresh).toBe("A-live-refresh")
   expect(r.sw_roundtrip.authAccess).toBe("A-live-access")
+})
+
+test("Component B: 400 invalid_grant → RefreshRevokedError (revoked=true)", () => {
+  expect(r.cls_ig.name).toBe("RefreshRevokedError")
+  expect(r.cls_ig.revoked).toBe(true)
+})
+
+test("Component B: 400 non-invalid_grant → generic Error (not revoked)", () => {
+  expect(r.cls_400.name).toBe("Error")
+  expect(r.cls_400.revoked).toBe(false)
+  expect(r.cls_400.message).toContain("token refresh failed (400)")
+})
+
+test("Component B: 5xx → generic Error (not revoked)", () => {
+  expect(r.cls_500.name).toBe("Error")
+  expect(r.cls_500.revoked).toBe(false)
+  expect(r.cls_500.message).toContain("token refresh failed (500)")
+})
+
+test("Component B: network error → generic Error (not revoked)", () => {
+  expect(r.cls_net.name).toBe("Error")
+  expect(r.cls_net.revoked).toBe(false)
+})
+
+test("Component C: applyToken sets token fields AND deletes needsReauth", () => {
+  expect(r.apply_unit.isFn).toBe(true)
+  expect(r.apply_unit.threw).toBe(false)
+  expect(r.apply_unit.refresh).toBe("new")
+  expect(r.apply_unit.access).toBe("new-a")
+  expect(r.apply_unit.hasFlag).toBe(false)
+})
+
+test("Component C: autoCapture re-login clears needsReauth (test 8a)", () => {
+  expect(r.cap_relogin.hasFlag).toBe(false)
+  expect(r.cap_relogin.refresh).toBe("cap2-refresh")
+})
+
+test("Component C collect: revoked inactive refresh → flagged + sentinel row + no re-hammer (test 2)", () => {
+  expect(r.creauth.row1Error).toBe("needs-reauth")
+  expect(r.creauth.flagged).toBe(true)
+  expect(r.creauth.posts1).toBe(1)
+  expect(r.creauth.row2Error).toBe("needs-reauth")
+  expect(r.creauth.posts2).toBe(0)
+})
+
+test("Component C collect: flagged account with no access/expires → skipped, no POST, no throw (test 9)", () => {
+  expect(r.creauth_noaccess.threw).toBe(false)
+  expect(r.creauth_noaccess.posts).toBe(0)
+  expect(r.creauth_noaccess.rowError).toBe("needs-reauth")
+})
+
+test("Component C switch: refuse flagged target → throws 需重新登录, auth.json unchanged, activeId unchanged (test 3)", () => {
+  expect(r.sw_flagged.threw).toBe(true)
+  expect(r.sw_flagged.msg).toContain("需重新登录")
+  expect(r.sw_flagged.authUnchanged).toBe(true)
+  expect(r.sw_flagged.activeId).toBe("acc1")
+  expect(r.sw_flagged.posts).toBe(0)
+})
+
+test("Component C switch: target refresh revoked → account flagged, auth.json unchanged (flag-on-revoked)", () => {
+  expect(r.sw_revoked.threw).toBe(true)
+  expect(r.sw_revoked.flagged).toBe(true)
+  expect(r.sw_revoked.authUnchanged).toBe(true)
+  expect(r.sw_revoked.activeId).toBe("acc1")
+})
+
+test("Component C switch: reverse-sync of OUTGOING active clears its needsReauth via applyToken (test 8b)", () => {
+  expect(r.sw_outgoing_clear.aRefresh).toBe("A-live-r-8b")
+  expect(r.sw_outgoing_clear.aHasFlag).toBe(false)
+  expect(r.sw_outgoing_clear.activeId).toBe("accB")
+})
+
+test("Component C retry: retryFlaggedRefresh success clears flag + rotates token (test 8c)", () => {
+  expect(r.retry_ok.isFn).toBe(true)
+  expect(r.retry_ok.threw).toBe(false)
+  expect(r.retry_ok.refresh).toBe("retry-new-r")
+  expect(r.retry_ok.hasFlag).toBe(false)
+  expect(r.retry_ok.posts).toBe(1)
+})
+
+test("Component C retry: retryFlaggedRefresh on still-dead token rejects + keeps flag", () => {
+  expect(r.retry_fail.threw).toBe(true)
+  expect(r.retry_fail.stillFlagged).toBe(true)
+  expect(r.retry_fail.refresh).toBe("B-still-dead")
+})
+
+test("Component A: PATH-5 concurrent collect+switch → single R1 POST, auth.json ends rotated R2 (not dead R1) (test 4)", () => {
+  expect(r.race_path5.posts).toBe(1)
+  expect(r.race_path5.lastRefreshInput).toBe("R1")
+  expect(r.race_path5.accBRefresh).toBe("R2")
+  expect(r.race_path5.authRefresh).toBe("R2")
+})
+
+test("Component A: switch makes B active mid-collect → collect skips B refresh (INV-2), B token not consumed (test 5)", () => {
+  expect(r.race_before_turn.bPosts).toBe(0)
+  expect(r.race_before_turn.authRefresh).toBe("B-R")
+  expect(r.race_before_turn.activeId).toBe("accB")
+})
+
+test("Component A/crash: save fails after refresh → dead token stays, next cycle flags, then no re-hammer (test 7)", () => {
+  expect(r.crash7.crashRefresh).toBe("c7-R1")
+  expect(r.crash7.flaggedCycle2).toBe(true)
+  expect(r.crash7.posts3).toBe(0)
+})
+
+test("Component D: activeId drifted mid-collect → doActiveSync SKIPS, keeps switch's live reverse-synced token (test 6a)", () => {
+  expect(r.dsync_drift.aRefresh).toBe("A-v2-r")
+  expect(r.dsync_drift.activeId).toBe("accB")
+})
+
+test("Component D: auth.json rotated mid-collect (activeId unchanged) → active record synced to LIVE token, not t0 snapshot (test 6b)", () => {
+  expect(r.dsync_rotate.aRefresh).toBe("AA-v2-r")
+  expect(r.dsync_rotate.activeId).toBe("accA")
+})
+
+test("R2 guard: collect refresh revoked BUT another process already rotated → adopt new token, NO false flag, usage shown", () => {
+  expect(r.guard_adopt.posts).toBe(1)
+  expect(r.guard_adopt.bRefresh).toBe("G2")
+  expect(r.guard_adopt.flagged).toBe(false)
+  expect(r.guard_adopt.rowHasUsage).toBe(true)
+  expect(r.guard_adopt.rowError).toBeUndefined()
+})
+
+test("R2 guard: switch target revoked BUT another process already rotated → adopt + switch succeeds, NO flag", () => {
+  expect(r.switch_adopt.threw).toBe(false)
+  expect(r.switch_adopt.authRefresh).toBe("S2")
+  expect(r.switch_adopt.bRefresh).toBe("S2")
+  expect(r.switch_adopt.flagged).toBe(false)
+  expect(r.switch_adopt.activeId).toBe("sB")
+})
+
+test("R2 guard: retry revoked BUT another process already rotated → adopt + flag cleared", () => {
+  expect(r.retry_adopt.threw).toBe(false)
+  expect(r.retry_adopt.bRefresh).toBe("R2x")
+  expect(r.retry_adopt.flagged).toBe(false)
+})
+
+test("R2 access-first: flagged account with STILL-VALID access → fresh usage shown, no error, 0 POSTs", () => {
+  expect(r.access_first.posts).toBe(0)
+  expect(r.access_first.rowHasUsage).toBe(true)
+  expect(r.access_first.rowNeedsReauth).toBe(true)
+  expect(r.access_first.rowError).toBeUndefined()
+})
+
+test("R3 no-cache: dead+no-access account shows the honest needs-reauth error row; NO cache file is ever written", () => {
+  expect(r.nocache.rowHasUsage).toBe(false)
+  expect(r.nocache.rowError).toBe("needs-reauth")
+  expect(r.nocache.rowNeedsReauth).toBe(true)
+  expect(r.nocache.cacheExists).toBe(false)
+})
+
+test("R3 keeper: ACTIVE chain expiring soon + IDLE → keeper pre-refreshes auth.json (staggered from ex-machina)", () => {
+  expect(r.keeper_active.posts).toBe(1)
+  expect(r.keeper_active.inputs).toEqual(["kact-r"])
+  expect(r.keeper_active.authRefresh).toBe("kact-new-r")
+  expect(r.keeper_active.authAccess).toBe("kact-new-a")
+})
+
+test("R3 keeper: ACTIVE chain expiring soon + session RUNNING → keeper never touches it (0 POSTs)", () => {
+  expect(r.keeper_active_running.posts).toBe(0)
+  expect(r.keeper_active_running.authRefresh).toBe("krun-r")
+})
+
+test("R3 keeper: REVOKED active chain is POSTed once then never hammered on later ticks", () => {
+  expect(r.keeper_active_dead.postsAfterFirst).toBe(1)
+  expect(r.keeper_active_dead.postsAfterSecond).toBe(1)
+  expect(r.keeper_active_dead.authRefresh).toBe("kdead-r")
+})
+
+test("R2 keeper: tick refreshes ONLY the stale inactive account — active(INV-2)/flagged/fresh all skipped", () => {
+  expect(r.keeper_tick.posts).toBe(1)
+  expect(r.keeper_tick.inputs).toEqual(["kB-r"])
+  expect(r.keeper_tick.bRefresh).toBe("kB-new-r")
+  expect(r.keeper_tick.cFlagged).toBe(true)
+  expect(r.keeper_tick.aRefresh).toBe("kA-r")
+})
+
+test("R2 keeper: auth.json change → new login captured by uuid (chain tip preserved)", () => {
+  expect(r.keeper_capture.captured).toBe(true)
+  expect(r.keeper_capture.u7Refresh).toBe("u7-refresh")
+  expect(r.keeper_capture.activeId).toBe("u7")
+})
+
+test("R2 keeper: subsequent rotation of the same chain re-captured (tip follows ex-machina)", () => {
+  expect(r.keeper_rotate.u7Refresh).toBe("u7-refresh-2")
+  expect(r.keeper_rotate.u7Access).toBe("u7-access-2")
+})
+
+test("R2 keeper: unchanged auth.json → no redundant profile fetch", () => {
+  expect(r.keeper_skip.extraProfile).toBe(0)
+})
+
+test("R2b must-fix: switch NEVER adopts a record that is itself flagged — refuses, auth.json untouched, flag+winner-token preserved", () => {
+  expect(r.switch_no_adopt_flagged.threw).toBe(true)
+  expect(r.switch_no_adopt_flagged.authUnchanged).toBe(true)
+  expect(r.switch_no_adopt_flagged.bRefresh).toBe("F2")
+  expect(r.switch_no_adopt_flagged.flagged).toBe(true)
+  expect(r.switch_no_adopt_flagged.activeId).toBe("fA")
+})
+
+test("R2b must-fix: collect does not un-flag an other-process-flagged record; row degrades to needsReauth (access-first ok)", () => {
+  expect(r.acquire_no_adopt_flagged.cRefresh).toBe("FC2")
+  expect(r.acquire_no_adopt_flagged.cFlagged).toBe(true)
+  expect(r.acquire_no_adopt_flagged.rowNeedsReauth).toBe(true)
+  expect(r.acquire_no_adopt_flagged.rowHasUsage).toBe(true)
+})
+
+test("R2b must-fix: retry NEVER clears the flag by adopting a flagged record — rejects, flag kept", () => {
+  expect(r.retry_no_adopt_flagged.threw).toBe(true)
+  expect(r.retry_no_adopt_flagged.dRefresh).toBe("FD2")
+  expect(r.retry_no_adopt_flagged.flagged).toBe(true)
 })
