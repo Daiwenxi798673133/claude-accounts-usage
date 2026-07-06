@@ -253,17 +253,6 @@ function AccountsPanel(props: {
   )
 }
 
-export function openRecoveryAlert(api: TuiPluginApi, labels: string[]): void {
-  if (labels.length === 0) return
-  const message =
-    labels.length === 1
-      ? `账号「${labels[0]}」额度应已恢复，可在 /usage 切回使用`
-      : `${labels.length} 个账号额度应已恢复：${labels.join("、")}`
-  const Alert = api.ui.DialogAlert
-  api.ui.dialog.setSize("medium")
-  api.ui.dialog.replace(() => <Alert title="额度恢复" message={message} onConfirm={() => api.ui.dialog.clear()} />)
-}
-
 function recoverIn(ms: number): string {
   const minutes = Math.max(1, Math.round(ms / 60_000))
   if (minutes < 60) return `${minutes} 分钟`

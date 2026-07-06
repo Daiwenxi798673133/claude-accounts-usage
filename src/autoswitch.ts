@@ -1,7 +1,7 @@
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 import { loadAccounts, readActiveId, type AccountsFile, type StoredAccount } from "./accounts.ts"
 import { log, redactHeaders, redactBody } from "./logger.ts"
-import { openRecoveryAlert, openExhaustedAlert } from "./dialogs.tsx"
+import { openExhaustedAlert } from "./dialogs.tsx"
 import { latestTurn } from "./turn.ts"
 import { decideRedo, type PartLike } from "./continuation.ts"
 import { collectAllUsage, switchToAccount, type AccountUsage, type UsageResponse } from "./usage.ts"
@@ -114,8 +114,6 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   // in `cooldown`, never passed to scheduleRecovery (a bogus timer clamps to ~1ms = false recovery).
   const cooldownPending = new Set<string>()
   const recoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
-  const pendingRecovered = new Map<string, string>()
-  let recoveryRetryTimer: ReturnType<typeof setTimeout> | undefined
   const attempted = new Map<string, Set<string>>()
   const sessionLocks = new Map<string, Promise<unknown>>()
   const repromptInFlight = new Set<string>()
@@ -155,7 +153,9 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
 
   // Estimated recovery only: the cooldown deadline comes from the rate-limit
   // response (or a default), so an elapsed timer means the quota *should* be
-  // back — we don't re-hit the API to verify before announcing.
+  // back — we don't re-hit the API to verify before clearing the cooldown. The
+  // account silently rejoins selection; the only visible action is auto-resuming
+  // stalled sessions (below).
   async function announceRecovery(id: string): Promise<void> {
     const file = await loadAccounts()
     const account = file.accounts.find((item) => item.id === id)
@@ -164,47 +164,25 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     if (!account) return
     // A recovered account with stalled sessions: switch back to it and auto-resume each
     // stalled turn via continue (riding Fix A's whole-turn aggregation). Excluded accounts
-    // are never auto-switched into — fall through to a plain recovery notice instead.
-    if (stalledSessions.size > 0 && !account.excluded) {
-      try {
-        await switchToAccount(id)
-        log.info("autoswitch:recover-resume", { id, sessions: stalledSessions.size })
-        api.ui.toast({
-          variant: "warning",
-          message: `「${account.label}」额度已恢复，正在自动续接 ${stalledSessions.size} 个会话`,
-        })
-        void refreshUsageInBackground()
-        for (const sid of [...stalledSessions]) {
-          stalledSessions.delete(sid)
-          attempted.delete(sid)
-          lastAction.delete(sid)
-          await repromptFailedTurn(sid, false)
-        }
-        return
-      } catch (error) {
-        log.warn("autoswitch:recover-resume-fail", { id, error: String(error) })
-        // fall through to announce
+    // are never auto-switched into — they just rejoin manual selection silently.
+    if (stalledSessions.size === 0 || account.excluded) return
+    try {
+      await switchToAccount(id)
+      log.info("autoswitch:recover-resume", { id, sessions: stalledSessions.size })
+      api.ui.toast({
+        variant: "warning",
+        message: `「${account.label}」额度已恢复，正在自动续接 ${stalledSessions.size} 个会话`,
+      })
+      void refreshUsageInBackground()
+      for (const sid of [...stalledSessions]) {
+        stalledSessions.delete(sid)
+        attempted.delete(sid)
+        lastAction.delete(sid)
+        await repromptFailedTurn(sid, false)
       }
+    } catch (error) {
+      log.warn("autoswitch:recover-resume-fail", { id, error: String(error) })
     }
-    pendingRecovered.set(id, account.label)
-    flushRecovered()
-  }
-
-  function flushRecovered(): void {
-    if (pendingRecovered.size === 0) return
-    if (api.ui.dialog.open) {
-      if (!recoveryRetryTimer) {
-        recoveryRetryTimer = setTimeout(() => {
-          recoveryRetryTimer = undefined
-          flushRecovered()
-        }, 3_000)
-      }
-      return
-    }
-    const labels = [...pendingRecovered.values()]
-    pendingRecovered.clear()
-    openRecoveryAlert(api, labels)
-    void refreshUsageInBackground()
   }
 
   function markCooldown(id: string, untilMs?: number): void {
@@ -227,7 +205,6 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       clearTimeout(timer)
       recoveryTimers.delete(id)
     }
-    pendingRecovered.delete(id)
     cooldownPending.delete(id)
     if (cooldown.delete(id)) {
       persistCooldown()
@@ -244,7 +221,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
   // Deadline: (1) server header; else (2) the account's binding-window FUTURE resets_at from cache.
   // resets_at is absolute wall-clock, so USAGE_CACHE_TTL_MS is intentionally NOT applied. Binding =
   // a window at the limit (util >= 100); not-maxed ⇒ undefined (honest unknown). Multiple maxed
-  // windows ⇒ the LATEST reset (never announce recovery before the last binding window clears).
+  // windows ⇒ the LATEST reset (never clear the cooldown before the last binding window clears).
   function resolveResetMs(error: RetryErrorLike, id?: string): number | undefined {
     const header = parseResetMs(error)
     if (header !== undefined) return header
@@ -642,7 +619,6 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
       }
       for (const timer of recoveryTimers.values()) clearTimeout(timer)
       recoveryTimers.clear()
-      if (recoveryRetryTimer) clearTimeout(recoveryRetryTimer)
       persistCooldown()
     },
     setUsageCache,
