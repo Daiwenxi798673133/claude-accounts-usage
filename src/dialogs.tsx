@@ -80,17 +80,19 @@ function AccountRow(props: {
   const isActive = () => props.account.id === props.activeId
   return (
     <box flexDirection="column">
-      <box flexDirection="row" gap={1}>
-        <text fg={props.selected ? theme().primary : theme().textMuted}>{props.selected ? "▶" : " "}</text>
-        <text fg={props.selected ? theme().primary : theme().text}>
-          {isActive() ? "●" : "○"} {props.account.label}
-          {isActive() ? " In Use" : ""}
-        </text>
+      <box flexDirection="row" justifyContent="space-between" gap={1}>
+        <box flexDirection="row" gap={1}>
+          <text fg={props.selected ? theme().primary : theme().textMuted}>{props.selected ? "▶" : " "}</text>
+          <text fg={props.selected ? theme().primary : theme().text}>
+            {isActive() ? "●" : "○"} {props.account.label}
+            {isActive() ? " In Use" : ""}
+          </text>
+          <Show when={props.pendingDelete}>
+            <text fg={theme().error}>确认删除? 再按 d · 其他键取消</text>
+          </Show>
+        </box>
         <Show when={props.account.excluded}>
-          <text fg={theme().textMuted}>不自动切</text>
-        </Show>
-        <Show when={props.pendingDelete}>
-          <text fg={theme().error}>确认删除? 再按 d · 其他键取消</text>
+          <text fg="#22D3EE">不自动切</text>
         </Show>
       </box>
       <box flexDirection="column" paddingLeft={4}>
