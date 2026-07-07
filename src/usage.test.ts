@@ -1043,7 +1043,7 @@ test("R2b must-fix: retry NEVER clears the flag by adopting a flagged record —
 const lockRunnerSource = `
 import { test, mock } from "bun:test"
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, unlinkSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { tmpdir, homedir } from "node:os"
 import { join } from "node:path"
 
 const SRC = process.env.CAU_SRC
@@ -1085,6 +1085,64 @@ try {
   results.recovered = { fn2Resolved: false, fn2Value: "REJECTED:" + err.name }
 }
 
+// ---- Todo-3: collectAllUsage degrades honestly on LockTimeoutError (never rejects) ----
+const { collectAllUsage } = await import(join(SRC, "usage.ts"))
+
+const authPath = join(process.env.XDG_DATA_HOME, "opencode", "auth.json")
+writeFileSync(authPath, JSON.stringify({ anthropic: { type: "oauth", access: "old-access", refresh: "old-refresh", expires: Date.now() - 1000 } }))
+
+const accountsDir3 = join(homedir(), ".config", "opencode")
+mkdirSync(accountsDir3, { recursive: true })
+writeFileSync(join(accountsDir3, "claude-accounts.json"), JSON.stringify({ version: 1, accounts: [{ id: "inact1", label: "Inactive1", refresh: "inact-r", access: "inact-a", expires: Date.now() + 3_600_000 }] }))
+
+const TOKEN_URL3 = realConstants.TOKEN_URL
+const USAGE_ENDPOINT3 = realConstants.USAGE_ENDPOINT
+globalThis.fetch = (async (input) => {
+  const url = String(input)
+  if (url === TOKEN_URL3) return { ok: true, status: 200, json: async () => ({ access_token: "new-access", refresh_token: "new-refresh", expires_in: 3600 }) }
+  if (url === USAGE_ENDPOINT3) return { ok: true, status: 200, json: async () => ({}) }
+  return { ok: true, status: 200, json: async () => ({}) }
+})
+
+// Plant the foreign lock via onPartial — collectAllUsage invokes onPartial synchronously
+// right after the inactive-account loop finishes and right BEFORE the deferred active
+// resolve. This means the inactive row (fresh token, no refresh needed) resolves healthy
+// BEFORE any contention exists; only the SUBSEQUENT active-deferred-resolve phase hits the
+// now-planted lock. This precisely isolates "inactive stays healthy, active degrades".
+let degradedThrew = false
+let degradedResult
+try {
+  degradedResult = await collectAllUsage({
+    isSessionRunning: () => false,
+    onPartial: () => { writeFileSync(lockPath, JSON.stringify({ pid: 999999, token: "foreign2", at: Date.now() })) },
+  })
+} catch {
+  degradedThrew = true
+}
+const degradedActive = degradedResult?.results.find((row) => row.active)
+const degradedInactive = degradedResult?.results.find((row) => !row.active)
+results.degrade = {
+  threw: degradedThrew,
+  activeError: degradedActive?.error ?? null,
+  inactivePresent: Boolean(degradedInactive),
+  inactiveHealthy: degradedInactive ? !degradedInactive.error : false,
+}
+
+unlinkSync(lockPath)
+let healedThrew = false
+let healedResult
+try {
+  healedResult = await collectAllUsage({ isSessionRunning: () => false })
+} catch {
+  healedThrew = true
+}
+const healedActive = healedResult?.results.find((row) => row.active)
+results.healed = {
+  threw: healedThrew,
+  activeError: healedActive?.error ?? null,
+  activeHasUsage: Boolean(healedActive?.usage),
+}
+
 writeFileSync(OUT, JSON.stringify(results))
 test("lock integration scenarios executed", () => {})
 `
@@ -1093,6 +1151,8 @@ type LockResults = {
   lockLocation: { existedDuring: boolean; goneAfter: boolean }
   poison: { threw: boolean; name: string; fn1Ran: boolean }
   recovered: { fn2Resolved: boolean; fn2Value: string }
+  degrade: { threw: boolean; activeError: string | null; inactivePresent: boolean; inactiveHealthy: boolean }
+  healed: { threw: boolean; activeError: string | null; activeHasUsage: boolean }
 }
 
 const lockRunnerDir = mkdtempSync(join(tmpdir(), "cau-lock-parent-"))
@@ -1122,4 +1182,17 @@ test("withAuthLock: a LockTimeoutError does NOT poison the in-process queue — 
   expect(lr.poison.fn1Ran).toBe(false)
   expect(lr.recovered.fn2Resolved).toBe(true)
   expect(lr.recovered.fn2Value).toBe("fn2-result")
+})
+
+test("collectAllUsage degrades the active row honestly on LockTimeoutError instead of rejecting the whole panel", () => {
+  expect(lr.degrade.threw).toBe(false)
+  expect(lr.degrade.activeError).toBe("额度暂不可用(等待 token 刷新)")
+  expect(lr.degrade.inactivePresent).toBe(true)
+  expect(lr.degrade.inactiveHealthy).toBe(true)
+})
+
+test("collectAllUsage: active row heals once the lock is free again", () => {
+  expect(lr.healed.threw).toBe(false)
+  expect(lr.healed.activeError).toBeNull()
+  expect(lr.healed.activeHasUsage).toBe(true)
 })

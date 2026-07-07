@@ -442,19 +442,31 @@ export async function collectAllUsage(opts: CollectOptions): Promise<{ activeId?
 
   let activeResolved = activeFast
   if (activeDeferred) {
-    const outcome = await acquireActiveAccess(isSessionRunning)
-    if (outcome.access) {
-      try {
-        const usage = await fetchUsage(outcome.access)
-        activeResolved = { ...activeBase, usage }
-      } catch (error) {
-        log.warn("usage:collect-active-fail", { error: errorMessage(error) })
-        activeResolved = { ...activeBase, error: errorMessage(error) }
-      }
-    } else {
+    let outcome: ActiveTokenOutcome | undefined
+    try {
+      outcome = await acquireActiveAccess(isSessionRunning)
+    } catch (error) {
+      // withFileLock (now live inside acquireActiveAccess's idle→withAuthLock branch) can
+      // throw LockTimeoutError BEFORE selfRefresh's own body (and its H2 catch) ever runs.
+      // Degrade this row honestly instead of rejecting the whole panel — inactive rows
+      // already collected above must still reach the caller.
+      log.warn("usage:collect-active-fail", { error: errorMessage(error) })
       activeResolved = { ...activeBase, error: "额度暂不可用(等待 token 刷新)" }
     }
-    activeAuth = outcome.authToken ?? activeAuth
+    if (outcome) {
+      if (outcome.access) {
+        try {
+          const usage = await fetchUsage(outcome.access)
+          activeResolved = { ...activeBase, usage }
+        } catch (error) {
+          log.warn("usage:collect-active-fail", { error: errorMessage(error) })
+          activeResolved = { ...activeBase, error: errorMessage(error) }
+        }
+      } else {
+        activeResolved = { ...activeBase, error: "额度暂不可用(等待 token 刷新)" }
+      }
+      activeAuth = outcome.authToken ?? activeAuth
+    }
   }
 
   const results = fastResults.map((row) => (row === activeFast ? activeResolved! : row))
@@ -466,26 +478,32 @@ export async function collectAllUsage(opts: CollectOptions): Promise<{ activeId?
   // auth.json.
   const doActiveSync = Boolean(activeRecord && activeAuth?.refresh)
   if (doActiveSync && activeRecord && activeAuth) {
-    await withAuthLock(async () => {
-      const current = await loadAccounts()
-      // activeId drifted mid-collect: a concurrent switch already reverse-synced the live
-      // token into this record, so our t0 snapshot is stale — never clobber it.
-      if (current.activeId !== activeRecord.id) {
-        log.debug("usage:active-sync-skip", { was: activeRecord.id, now: current.activeId })
-        return
-      }
-      const index = current.accounts.findIndex((existing) => existing.id === activeRecord.id)
-      if (index >= 0) {
-        // Prefer auth.json AS IT IS NOW (ex-machina may have rotated during collect) over the
-        // t0 activeAuth snapshot; fall back to the snapshot only if auth.json lost its refresh.
-        const nowAuth = await readAuthAnthropic()
-        applyToken(
-          current.accounts[index],
-          nowAuth?.refresh ? { refresh: nowAuth.refresh, access: nowAuth.access, expires: nowAuth.expires } : activeAuth,
-        )
-      }
-      await saveAccounts(current)
-    })
+    try {
+      await withAuthLock(async () => {
+        const current = await loadAccounts()
+        // activeId drifted mid-collect: a concurrent switch already reverse-synced the live
+        // token into this record, so our t0 snapshot is stale — never clobber it.
+        if (current.activeId !== activeRecord.id) {
+          log.debug("usage:active-sync-skip", { was: activeRecord.id, now: current.activeId })
+          return
+        }
+        const index = current.accounts.findIndex((existing) => existing.id === activeRecord.id)
+        if (index >= 0) {
+          // Prefer auth.json AS IT IS NOW (ex-machina may have rotated during collect) over the
+          // t0 activeAuth snapshot; fall back to the snapshot only if auth.json lost its refresh.
+          const nowAuth = await readAuthAnthropic()
+          applyToken(
+            current.accounts[index],
+            nowAuth?.refresh ? { refresh: nowAuth.refresh, access: nowAuth.access, expires: nowAuth.expires } : activeAuth,
+          )
+        }
+        await saveAccounts(current)
+      })
+    } catch (error) {
+      // Reverse-sync is best-effort: a lock timeout here must not blank the panel either.
+      // The next collect cycle retries this sync.
+      log.warn("usage:active-sync-fail", { error: errorMessage(error) })
+    }
   }
 
   return { activeId: file.activeId, results }
