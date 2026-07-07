@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdir, rename } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join, dirname } from "node:path"
 import { log } from "./logger.ts"
+import { withFileLock } from "./lockfile.ts"
 
 export type StoredAccount = {
   id: string
@@ -81,16 +82,33 @@ export function getAuthJsonPath(): Promise<string> {
   return resolveAuthJsonPath()
 }
 
-// Serializes auth.json / claude-accounts.json read-modify-writes. NOT reentrant:
-// never nest withAuthLock inside another withAuthLock or it deadlocks.
+// Lazily resolve (and cache) the cross-process lock path. MUST be invoked only from
+// inside withAuthLock (first call), NEVER at import time: resolving before auth.json
+// exists can cache candidates[0] while a later process — seeing the file already
+// materialized at a different candidate — resolves there instead ⇒ the two processes
+// lock DIFFERENT paths ⇒ split lock domains ⇒ silent loss of mutual exclusion.
+// The lock lives in the DATA dir beside auth.json (not the config dir): usage.test.ts's
+// crash-persist scenario chmods the config dir 0o500 mid-section, which would break lock
+// release if the lock lived there. The filename deliberately does NOT start with
+// "auth.json" so keeper.ts's watcher filter (keeper.ts:82, ignores names not starting
+// with "auth.json") never fires on lock churn.
+let lockPathPromise: Promise<string> | undefined
+function authLockPath(): Promise<string> {
+  lockPathPromise ??= resolveAuthJsonPath().then((path) => join(dirname(path), "claude-accounts-usage.lock"))
+  return lockPathPromise
+}
+
+// Serializes auth.json / claude-accounts.json read-modify-writes, now behind a
+// cross-process file lock so concurrent OpenCode instances are mutually exclusive too.
+// Still NOT reentrant in-process: never nest withAuthLock inside another withAuthLock or
+// it deadlocks the in-process queue (as before) — and would now also self-contend on the
+// file lock.
 let authLock: Promise<unknown> = Promise.resolve()
 
 export function withAuthLock<T>(fn: () => Promise<T>): Promise<T> {
-  const run = authLock.then(fn, fn)
-  authLock = run.then(
-    () => undefined,
-    () => undefined,
-  )
+  const job = async () => withFileLock(await authLockPath(), fn)
+  const run = authLock.then(job, job)
+  authLock = run.then(() => undefined, () => undefined)
   return run
 }
 

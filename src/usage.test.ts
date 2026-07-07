@@ -61,6 +61,9 @@ mock.module(join(SRC, "constants.ts"), () => ({
   NETWORK_TIMEOUT_MS: 15000,
   KEEPALIVE_TICK_MS: 300000,
   WATCH_DEBOUNCE_MS: 50,
+  LOCK_STALE_MS: 45000,
+  LOCK_ACQUIRE_TIMEOUT_MS: 30000,
+  LOCK_POLL_MS: 100,
 }))
 
 const USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
@@ -1027,4 +1030,96 @@ test("R2b must-fix: retry NEVER clears the flag by adopting a flagged record —
   expect(r.retry_no_adopt_flagged.threw).toBe(true)
   expect(r.retry_no_adopt_flagged.dRefresh).toBe("FD2")
   expect(r.retry_no_adopt_flagged.flagged).toBe(true)
+})
+
+// SECOND, INDEPENDENT child runner (not a modification of runnerSource above): exercises
+// the REAL accounts.ts withAuthLock through the now-live cross-process file lock. Runs in
+// a fresh child for the same reason as runnerSource (autoswitch.test.ts's process-global
+// mock.module of accounts.ts leaks in-process). Its constants mock speeds ONLY
+// LOCK_ACQUIRE_TIMEOUT_MS to 500ms so the poisoning-regression times out in <1s instead of
+// 30 real seconds, while LOCK_STALE_MS stays at the prod 45s — so the deliberately-FRESH
+// foreign lock is genuinely CONTENDED (acquire times out) rather than STOLEN as stale;
+// 45s ≫ 500ms guarantees the timeout path, not the steal path, is what gets exercised.
+const lockRunnerSource = `
+import { test, mock } from "bun:test"
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, unlinkSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+const SRC = process.env.CAU_SRC
+const OUT = process.env.CAU_OUT
+
+const dataHome = mkdtempSync(join(tmpdir(), "cau-lock-run-"))
+process.env.XDG_DATA_HOME = dataHome
+mkdirSync(join(dataHome, "opencode"), { recursive: true })
+const lockPath = join(process.env.XDG_DATA_HOME, "opencode", "claude-accounts-usage.lock")
+
+const realConstants = await import(join(SRC, "constants.ts"))
+mock.module(join(SRC, "constants.ts"), () => ({
+  ...realConstants,
+  LOCK_ACQUIRE_TIMEOUT_MS: 500,
+  LOCK_STALE_MS: 45000,
+  LOCK_POLL_MS: 100,
+}))
+
+const { withAuthLock } = await import(join(SRC, "accounts.ts"))
+
+const results = {}
+
+const existedDuring = await withAuthLock(async () => existsSync(lockPath))
+results.lockLocation = { existedDuring, goneAfter: !existsSync(lockPath) }
+
+writeFileSync(lockPath, JSON.stringify({ pid: 999999, token: "foreign", at: Date.now() }))
+let fn1Ran = false
+try {
+  await withAuthLock(async () => { fn1Ran = true })
+  results.poison = { threw: false, name: "", fn1Ran }
+} catch (err) {
+  results.poison = { threw: true, name: err.name, fn1Ran }
+}
+unlinkSync(lockPath)
+try {
+  const fn2Value = await withAuthLock(async () => "fn2-result")
+  results.recovered = { fn2Resolved: true, fn2Value }
+} catch (err) {
+  results.recovered = { fn2Resolved: false, fn2Value: "REJECTED:" + err.name }
+}
+
+writeFileSync(OUT, JSON.stringify(results))
+test("lock integration scenarios executed", () => {})
+`
+
+type LockResults = {
+  lockLocation: { existedDuring: boolean; goneAfter: boolean }
+  poison: { threw: boolean; name: string; fn1Ran: boolean }
+  recovered: { fn2Resolved: boolean; fn2Value: string }
+}
+
+const lockRunnerDir = mkdtempSync(join(tmpdir(), "cau-lock-parent-"))
+const lockRunnerPath = join(lockRunnerDir, "lock-runner.test.ts")
+const lockOutPath = join(lockRunnerDir, "lock-results.json")
+writeFileSync(lockRunnerPath, lockRunnerSource)
+
+const lockChildHome = mkdtempSync(join(tmpdir(), "cau-lock-home-"))
+const lockProc = Bun.spawnSync(["bun", "test", lockRunnerPath], {
+  env: { ...process.env, CAU_SRC: import.meta.dir, CAU_OUT: lockOutPath, HOME: lockChildHome },
+  stdout: "pipe",
+  stderr: "pipe",
+})
+if (lockProc.exitCode !== 0) {
+  throw new Error(`withAuthLock lock runner failed (exit ${lockProc.exitCode}):\n${lockProc.stderr.toString()}\n${lockProc.stdout.toString()}`)
+}
+const lr = JSON.parse(readFileSync(lockOutPath, "utf8")) as LockResults
+
+test("withAuthLock holds the lock at XDG_DATA_HOME/opencode/claude-accounts-usage.lock during the critical section and removes it after resolution", () => {
+  expect(lr.lockLocation.existedDuring).toBe(true)
+  expect(lr.lockLocation.goneAfter).toBe(true)
+})
+
+test("withAuthLock: a LockTimeoutError does NOT poison the in-process queue — fn never ran, and the next call still runs and resolves", () => {
+  expect(lr.poison.threw).toBe(true)
+  expect(lr.poison.name).toBe("LockTimeoutError")
+  expect(lr.poison.fn1Ran).toBe(false)
+  expect(lr.recovered.fn2Resolved).toBe(true)
+  expect(lr.recovered.fn2Value).toBe("fn2-result")
 })
