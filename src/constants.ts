@@ -39,3 +39,12 @@ export const NETWORK_TIMEOUT_MS = 15_000
 // lost across an out-of-band switch (`opencode auth login`, restart).
 export const KEEPALIVE_TICK_MS = 5 * 60_000
 export const WATCH_DEBOUNCE_MS = 500
+
+// Cross-process auth lock (src/lockfile.ts). Max legitimate hold = one network call bounded by
+// NETWORK_TIMEOUT_MS (15s) + file I/O, so 3× that margin before a lock is presumed abandoned and stolen.
+export const LOCK_STALE_MS = 45_000
+// Worst realistic wait = one other instance's full 15s critical section; on expiry THROW (never
+// silently proceed unlocked, which would re-open the token-clobber race this lock exists to close).
+export const LOCK_ACQUIRE_TIMEOUT_MS = 30_000
+// Poll interval while another instance holds a still-live lock (jittered at the call site).
+export const LOCK_POLL_MS = 100
