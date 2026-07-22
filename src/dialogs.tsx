@@ -62,9 +62,11 @@ function WindowRow(props: { api: TuiPluginApi; name: string; win?: UsageWindow |
   )
 }
 
-function ModelWindowRow(props: { api: TuiPluginApi; usage: () => UsageResponse }) {
-  const opus = () => props.usage().seven_day_opus
-  return <WindowRow api={props.api} name={opus() ? "Opus" : "Sonnet"} win={opus() ?? props.usage().seven_day_sonnet} />
+// Per-model weekly windows (e.g. "Fable"); replaces the old Opus/Sonnet row now null.
+function ModelWindowRows(props: { api: TuiPluginApi; usage: () => UsageResponse }) {
+  return (
+    <For each={props.usage().scoped ?? []}>{(win) => <WindowRow api={props.api} name={win.label} win={win} />}</For>
+  )
 }
 
 function AccountRow(props: {
@@ -107,7 +109,7 @@ function AccountRow(props: {
             <box flexDirection="column">
               <WindowRow api={props.api} name="5h" win={usage().five_hour} />
               <WindowRow api={props.api} name="7d" win={usage().seven_day} />
-              <ModelWindowRow api={props.api} usage={usage} />
+              <ModelWindowRows api={props.api} usage={usage} />
             </box>
           )}
         </Show>
