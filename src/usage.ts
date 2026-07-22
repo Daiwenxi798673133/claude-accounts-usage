@@ -36,14 +36,41 @@ const refresh429Cooldown = new Map<string, number>()
 
 export type UsageWindow = { utilization: number; resets_at?: string }
 
-// Windows the account doesn't have come back as `null`, not omitted. There's no
-// dedicated Sonnet weekly limit (Anthropic tracks overall `seven_day` + Opus-only
-// `seven_day_opus`), so `seven_day_sonnet` is null for most accounts.
+// A per-model weekly window whose model name (e.g. "Fable") is dynamic, so it rides with
+// the window as `label`.
+export type ScopedUsageWindow = UsageWindow & { label: string }
+
+// Anthropic moved the per-model weekly breakdown out of the fixed `seven_day_opus` /
+// `seven_day_sonnet` fields (now null for most accounts) into the `limits[]` array;
+// fetchUsage normalizes those `weekly_scoped` entries into `scoped`. Legacy fields kept
+// for any account/plan that still populates them. Absent windows arrive as `null`.
 export type UsageResponse = {
   five_hour?: UsageWindow | null
   seven_day?: UsageWindow | null
   seven_day_sonnet?: UsageWindow | null
   seven_day_opus?: UsageWindow | null
+  scoped?: ScopedUsageWindow[]
+}
+
+type RawLimit = {
+  kind?: string
+  percent?: unknown
+  resets_at?: unknown
+  scope?: { model?: { display_name?: unknown } | null } | null
+}
+
+function scopedFromLimits(limits: unknown): ScopedUsageWindow[] | undefined {
+  if (!Array.isArray(limits)) return undefined
+  const out: ScopedUsageWindow[] = []
+  for (const raw of limits as RawLimit[]) {
+    if (raw?.kind !== "weekly_scoped") continue
+    const label = raw.scope?.model?.display_name
+    if (typeof label !== "string" || label.length === 0) continue
+    if (typeof raw.percent !== "number" || !Number.isFinite(raw.percent)) continue
+    const resets_at = typeof raw.resets_at === "string" ? raw.resets_at : undefined
+    out.push({ label, utilization: raw.percent, resets_at })
+  }
+  return out.length > 0 ? out : undefined
 }
 
 export type AccountUsage = {
@@ -203,7 +230,10 @@ export async function fetchUsage(access: string): Promise<UsageResponse> {
     log.warn("usage:fetch-fail", { status: res.status })
     throw new Error(`usage request failed (${res.status})`)
   }
-  return (await res.json()) as UsageResponse
+  const usage = (await res.json()) as UsageResponse & { limits?: unknown }
+  const scoped = scopedFromLimits(usage.limits)
+  if (scoped) usage.scoped = scoped
+  return usage
 }
 
 // Identify whatever account ex-machina currently holds in auth.json by its profile
