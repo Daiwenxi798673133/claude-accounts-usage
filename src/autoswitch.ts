@@ -93,6 +93,7 @@ function score(usage?: UsageResponse): number {
     usage.seven_day?.utilization ?? 0,
     usage.seven_day_sonnet?.utilization ?? 0,
     usage.seven_day_opus?.utilization ?? 0,
+    ...(usage.scoped?.map((win) => win.utilization) ?? []),
   )
 }
 
@@ -230,7 +231,7 @@ export function installAutoSwitch(api: TuiPluginApi): AutoSwitchController {
     if (!usage) return undefined
     const now = Date.now()
     const candidates: { util: number; at: number }[] = []
-    for (const win of [usage.five_hour, usage.seven_day, usage.seven_day_sonnet, usage.seven_day_opus]) {
+    for (const win of [usage.five_hour, usage.seven_day, usage.seven_day_sonnet, usage.seven_day_opus, ...(usage.scoped ?? [])]) {
       if (!win || win.resets_at === undefined) continue
       const at = Date.parse(win.resets_at)
       if (!Number.isFinite(at) || at <= now) continue
