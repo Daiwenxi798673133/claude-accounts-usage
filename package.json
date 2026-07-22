@@ -25,13 +25,14 @@
   ],
   "exports": {
     ".": {
-      "import": "./tui.tsx"
+      "import": "./dist/tui.js"
     },
     "./tui": {
-      "import": "./tui.tsx"
+      "import": "./dist/tui.js"
     }
   },
   "files": [
+    "dist",
     "tui.tsx",
     "src",
     "!src/**/*.test.ts",
@@ -46,8 +47,9 @@
     "access": "public"
   },
   "scripts": {
+    "build": "bun run scripts/build.ts",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "tsc --noEmit"
+    "prepublishOnly": "tsc --noEmit && bun run build"
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.17.4",
