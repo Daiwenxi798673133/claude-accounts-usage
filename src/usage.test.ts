@@ -518,6 +518,16 @@ writeAuth(oauth("u7-access-2", "u7-refresh-2", future()))
   results.keeper_skip = { extraProfile: profileFetches - before }
 }
 
+// ---- Fable: /usage limits[] weekly_scoped normalized into usage.scoped (per-model weekly window) ----
+reset("ok"); usageBody = { five_hour: { utilization: 53, resets_at: bodyFuture() }, seven_day: { utilization: 48, resets_at: bodyFuture() }, seven_day_opus: null, seven_day_sonnet: null, limits: [ { kind: "session", percent: 53 }, { kind: "weekly_all", percent: 48 }, { kind: "weekly_scoped", percent: 7, resets_at: bodyFuture(), scope: { model: { display_name: "Fable" } } }, { kind: "weekly_scoped", percent: 3, resets_at: bodyFuture(), scope: { model: { display_name: null } } }, { kind: "weekly_scoped", percent: NaN, resets_at: bodyFuture(), scope: { model: { display_name: "Ghost" } } }, { kind: "weekly_scoped", percent: 9, resets_at: 999, scope: { model: { display_name: "Cove" } } } ] }
+writeAuth(oauth("fable-a", "fable-r", future()))
+writeAccounts({ version: 1, activeId: "fbl", accounts: [{ id: "fbl", label: "FBL", refresh: "fbl-r", access: "fbl-a", expires: future() }] })
+{
+  const res = await collectAllUsage({ isSessionRunning: () => false })
+  const row = activeRow(res)
+  results.scoped_fable = { scoped: row?.usage?.scoped ?? null, sevenDayOpus: row?.usage?.seven_day_opus ?? null, hasFiveHour: Boolean(row?.usage?.five_hour) }
+}
+
 writeFileSync(OUT, JSON.stringify(results))
 test("acquireActiveAccess scenarios executed", () => {})
 `
@@ -614,6 +624,7 @@ type Results = {
   keeper_tick: KeeperTickRow; keeper_capture: KeeperCaptureRow; keeper_rotate: KeeperRotateRow; keeper_skip: KeeperSkipRow
   keeper_active: KeeperActiveRow; keeper_active_running: KeeperActiveRow; keeper_active_dead: KeeperActiveDeadRow
   switch_no_adopt_flagged: SwitchNoAdoptRow; acquire_no_adopt_flagged: AcquireNoAdoptRow; retry_no_adopt_flagged: RetryNoAdoptRow
+  scoped_fable: { scoped: Array<{ label: string; utilization: number; resets_at?: string }> | null; sevenDayOpus: unknown; hasFiveHour: boolean }
 }
 
 const runnerDir = mkdtempSync(join(tmpdir(), "cau-parent-"))
@@ -1195,4 +1206,19 @@ test("collectAllUsage: active row heals once the lock is free again", () => {
   expect(lr.healed.threw).toBe(false)
   expect(lr.healed.activeError).toBeNull()
   expect(lr.healed.activeHasUsage).toBe(true)
+})
+
+test("collectAllUsage normalizes limits[] weekly_scoped into usage.scoped (Fable), skipping unnamed/non-scoped entries", () => {
+  expect(r.scoped_fable.scoped).not.toBeNull()
+  const byLabel = Object.fromEntries(r.scoped_fable.scoped!.map((w) => [w.label, w]))
+  // kept: named + finite percent (Fable, Cove). skipped: unnamed(null) + non-finite percent(Ghost/NaN).
+  expect(r.scoped_fable.scoped!.length).toBe(2)
+  expect(byLabel.Fable.utilization).toBe(7)
+  expect(typeof byLabel.Fable.resets_at).toBe("string")
+  expect(byLabel.Ghost).toBeUndefined()
+  // non-string resets_at (Cove sent a number) normalized to undefined, entry still kept
+  expect(byLabel.Cove.utilization).toBe(9)
+  expect(byLabel.Cove.resets_at).toBeUndefined()
+  expect(r.scoped_fable.hasFiveHour).toBe(true)
+  expect(r.scoped_fable.sevenDayOpus).toBeNull()
 })
