@@ -66,13 +66,13 @@ TUI 插件只在 `~/.config/opencode/tui.json` 配置,**不要**放进 `opencode
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["claude-accounts-usage@0.2.4"]
+  "plugin": ["claude-accounts-usage@0.2.5"]
 }
 ```
 
 OpenCode 会自动解析并安装该包,无需手动 `npm install`。
 
-> `0.2.4` 是当前**最新稳定版**(在 0.2.3 基础上新增支持 Anthropic 新的按模型周额度——如 `Fable`——在 `/usage` 面板显示,并让自动切号的选号与冷却纳入该额度;此前含多开实例抢刷 refresh token 修复、某些账号状态下打开 `/usage` 会崩溃的修复、`/stats` 仪表盘、自动切号数据丢失修复,以及当前账号 token 刷新竞态修复)。
+> `0.2.5` 是当前**最新稳定版**(在 0.2.4 基础上修复了通过 npm 安装时 `/usage` 首次打开卡"加载中"、且无法上下切换账号的故障——根因是插件以原始 `.tsx` 发布,落在 `node_modules` 下时被 `@opentui/solid` 的 JSX 编译跳过而丢失响应式,现改为发布预编译产物 `dist/tui.js`;此前含 `Fable` 按模型周额度显示、多开实例抢刷 refresh token 修复、某些账号状态下打开 `/usage` 会崩溃的修复、`/stats` 仪表盘、自动切号数据丢失修复,以及当前账号 token 刷新竞态修复)。
 >
 > **建议带上版本号**。OpenCode 按"含版本号的包名"建独立缓存目录:写死版本号后,以后升级只需把后缀改成新版本号;若不带版本号,会被首次安装的版本锁住,发布新版也不会自动更新。
 
